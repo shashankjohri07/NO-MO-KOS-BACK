@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
+import cors from 'cors';
 import multer from 'multer';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -20,6 +21,7 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 },
 });
 
+app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json({ limit: '200mb' }));
 
 app.get('/api/health', (_req: Request, res: Response) => {
