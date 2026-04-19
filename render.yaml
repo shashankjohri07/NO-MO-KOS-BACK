@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: no-mi-kos-back
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3001
