@@ -49,6 +49,16 @@ app.post('/api/detect-errors', upload.array('document', 5), async (req: Request,
       args.push('--file', p);
     }
 
+    const parsePageNum = (raw: unknown): number | null => {
+      if (raw === undefined || raw === null || raw === '') return null;
+      const n = Number(raw);
+      return Number.isInteger(n) && n >= 1 ? n : null;
+    };
+    const indexStart = parsePageNum((req.body as Record<string, unknown>)?.index_start);
+    const indexEnd = parsePageNum((req.body as Record<string, unknown>)?.index_end);
+    if (indexStart !== null) args.push('--index-start', String(indexStart));
+    if (indexEnd !== null) args.push('--index-end', String(indexEnd));
+
     const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const proc = spawn('python3', args, {
         cwd: join(__dirname, 'server'),

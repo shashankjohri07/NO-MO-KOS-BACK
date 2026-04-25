@@ -405,23 +405,34 @@ def _extract_printed_page_number(page: dict) -> Optional[int]:
     return None
 
 
-def check_rule_3_pagination(pages: list) -> dict:
+def check_rule_3_pagination(pages: list, index_end: Optional[int] = None) -> dict:
     """Rule 3: Read printed page numbers from the document (top-right) and check for
     sequential numbering with no duplicates. This checks the DOCUMENT's own numbering,
-    not the PDF page index."""
+    not the PDF page index.
+
+    If `index_end` is provided (1-based PDF page number where the index/contents
+    ends), pagination check starts on the page immediately AFTER that. Otherwise
+    we fall back to auto-detecting the body by looking for the first page whose
+    printed number is 1.
+    """
     if not pages:
         return {"rule_id": "PAGINATION", "status": "info", "severity": "high",
                 "description": "Page numbering — no duplicate pagination", "detail": "No pages."}
 
-    # Pagination begins where the document's own numbering starts — the first
-    # page whose printed (top-right) number is 1. Pages before that (cover,
-    # title, memo of parties, index, etc.) are front matter and intentionally
-    # unnumbered — they must NOT be checked for pagination.
+    # If the user told us where the index ends, pagination begins on the next
+    # PDF page. Convert 1-based PDF page number → 0-based list index.
     start_idx = None
-    for i, page in enumerate(pages):
-        if page.get("printed_num") == 1:
-            start_idx = i
-            break
+    if index_end is not None and 1 <= index_end < len(pages):
+        start_idx = index_end  # pages[index_end] is the first page AFTER the index
+    else:
+        # Auto-detect: pagination begins where the document's own numbering
+        # starts — the first page whose printed (top-right) number is 1. Pages
+        # before that (cover, title, memo of parties, index, etc.) are front
+        # matter and intentionally unnumbered — they must NOT be checked.
+        for i, page in enumerate(pages):
+            if page.get("printed_num") == 1:
+                start_idx = i
+                break
 
     if start_idx is None:
         return {
@@ -511,10 +522,16 @@ def check_rule_3_pagination(pages: list) -> dict:
         refs.extend({"page_num": n} for n in gaps[:20])
 
     # Build detail
-    header = (
-        f"We checked the page numbers written at the top-right of every page "
-        f"(we ignored the first {front_matter_count} page(s) — cover and index, which don't need page numbers"
-    )
+    if index_end is not None:
+        header = (
+            f"We checked the page numbers written at the top-right of every page "
+            f"(we ignored the first {front_matter_count} page(s) — index ends at PDF page {index_end} as you specified, so pagination starts after that"
+        )
+    else:
+        header = (
+            f"We checked the page numbers written at the top-right of every page "
+            f"(we ignored the first {front_matter_count} page(s) — cover and index, which don't need page numbers"
+        )
     if annexure_tail_count:
         header += f"; and the last {annexure_tail_count} page(s) — annexures that use their own numbering, which shouldn't be compared with the main body"
     header += ")."
@@ -791,8 +808,17 @@ def generate_annotated_pdf(input_path: str, output_path: str, results: list, pag
 # Main Pipeline
 # =============================================================================
 
-def run_full_analysis(file_path: str) -> dict:
-    """Run the 5-rule analysis pipeline."""
+def run_full_analysis(
+    file_path: str,
+    index_start: Optional[int] = None,
+    index_end: Optional[int] = None,
+) -> dict:
+    """Run the 5-rule analysis pipeline.
+
+    `index_start` / `index_end` are 1-based PDF page numbers marking where the
+    index/contents section sits. When provided, pagination (Rule 3) starts
+    counting on the page right after `index_end`.
+    """
 
     # Step 1: Extract text
     print(f"Extracting text from: {file_path}", file=sys.stderr)
@@ -807,13 +833,15 @@ def run_full_analysis(file_path: str) -> dict:
     ocr_method = extraction.get("ocr_method", "pymupdf")
 
     print(f"Extracted from {total_pages} pages (method: {ocr_method})", file=sys.stderr)
+    if index_end is not None:
+        print(f"User-specified index: pages {index_start or '?'}–{index_end} (pagination starts after page {index_end})", file=sys.stderr)
 
     # Step 2: Run the 5 rules
     print("Running 5-rule scan...", file=sys.stderr)
     all_results = [
         check_rule_1_draft(pages, full_text_upper),
         check_rule_2_doc_upload(pages, full_text_upper),
-        check_rule_3_pagination(pages),
+        check_rule_3_pagination(pages, index_end=index_end),
         check_rule_4_sign_stamp_annexures(pages),
         check_rule_5_true_copy_annexures(pages),
         check_rule_6_index_page_numbers(pages),
@@ -903,9 +931,30 @@ def merge_pdfs(input_paths: list, output_path: str) -> bool:
         return False
 
 
+def _prompt_int(label: str) -> Optional[int]:
+    """Prompt the user for a 1-based PDF page number. Blank/invalid → None."""
+    try:
+        raw = input(f"{label} (press Enter to skip): ").strip()
+    except EOFError:
+        return None
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+        return n if n >= 1 else None
+    except ValueError:
+        print(f"  Ignoring invalid number: {raw!r}", file=sys.stderr)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Appeal Document Scanner — 6 Rule Check")
     parser.add_argument("--file", action="append", help="Path to PDF (repeat for multiple volumes, processed in order)")
+    parser.add_argument("--index-start", type=int, default=None,
+                        help="PDF page number (1-based) where the index/contents section starts")
+    parser.add_argument("--index-end", type=int, default=None,
+                        help="PDF page number (1-based) where the index/contents section ends. "
+                             "Pagination check starts on the page right after this.")
     args = parser.parse_args()
 
     if not args.file:
@@ -923,7 +972,17 @@ def main():
         target_path = tmp.name
         print(f"Merged {len(args.file)} PDFs -> {target_path}", file=sys.stderr)
 
-    report = run_full_analysis(target_path)
+    # If the caller didn't pass --index-start/--index-end and we're running in
+    # an interactive terminal, ask the user. When invoked from the Node server
+    # there's no TTY, so this block is skipped and the CLI args are authoritative.
+    index_start = args.index_start
+    index_end = args.index_end
+    if index_start is None and index_end is None and sys.stdin.isatty():
+        print("\nIndex page range — used so pagination starts AFTER the index.", file=sys.stderr)
+        index_start = _prompt_int("Index start PDF page")
+        index_end = _prompt_int("Index end PDF page")
+
+    report = run_full_analysis(target_path, index_start=index_start, index_end=index_end)
     # Preserve the original filename(s) in the report
     if len(args.file) > 1:
         report["file"] = " + ".join(os.path.basename(f) for f in args.file)
