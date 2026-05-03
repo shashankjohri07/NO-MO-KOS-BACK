@@ -39,8 +39,20 @@ app.post('/api/detect-errors', upload.array('document', 5), async (req: Request,
   const originalNames = files.map((f) => f.originalname).join(' + ');
   const totalMB = files.reduce((acc, f) => acc + f.size, 0) / 1024 / 1024;
 
+  // 1-indexed last page of the index. Pages 1..N are skipped from the
+  // pagination check. Defaults to 0 (= start checking from page 1).
+  const rawIndexEnd = (req.body?.indexEndPage ?? '0') as string;
+  const parsedIndexEnd = Number.parseInt(rawIndexEnd, 10);
+  const indexEndPage = Number.isFinite(parsedIndexEnd) && parsedIndexEnd >= 0 ? parsedIndexEnd : 0;
+
+  // mode: "detect" (rule check only) | "write" (stamp page numbers only —
+  // skips extraction + rules for speed) | "both" (run everything).
+  const rawMode = String(req.body?.mode ?? 'detect').toLowerCase();
+  const mode: 'detect' | 'write' | 'both' =
+    rawMode === 'write' || rawMode === 'both' ? rawMode : 'detect';
+
   console.log(
-    `[detect-errors] Processing ${files.length} file(s): ${originalNames} (${totalMB.toFixed(1)}MB total)`,
+    `[detect-errors] Processing ${files.length} file(s): ${originalNames} (${totalMB.toFixed(1)}MB total) — indexEndPage=${indexEndPage} mode=${mode}`,
   );
 
   try {
@@ -48,23 +60,17 @@ app.post('/api/detect-errors', upload.array('document', 5), async (req: Request,
     for (const p of filePaths) {
       args.push('--file', p);
     }
-
-    const parsePageNum = (raw: unknown): number | null => {
-      if (raw === undefined || raw === null || raw === '') return null;
-      const n = Number(raw);
-      return Number.isInteger(n) && n >= 1 ? n : null;
-    };
-    const indexStart = parsePageNum((req.body as Record<string, unknown>)?.index_start);
-    const indexEnd = parsePageNum((req.body as Record<string, unknown>)?.index_end);
-    if (indexStart !== null) args.push('--index-start', String(indexStart));
-    if (indexEnd !== null) args.push('--index-end', String(indexEnd));
+    args.push('--index-end-page', String(indexEndPage));
+    args.push('--mode', mode);
 
     const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const proc = spawn('python3', args, {
         cwd: join(__dirname, 'server'),
         env: {
           ...process.env,
-          PATH: `/usr/local/bin:/usr/bin:/opt/homebrew/bin:${process.env.PATH ?? ''}`,
+          // User PATH first (so pyenv/system python with installed deps wins),
+          // brew/system bin paths appended for tesseract binary discovery.
+          PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
           PYTHONPATH: join(__dirname, 'server'),
         },
         timeout: 600_000,
