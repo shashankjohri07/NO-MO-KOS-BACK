@@ -151,12 +151,18 @@ app.post('/api/upload', upload.single('document'), (req: Request, res: Response)
 const uploadDualFields = upload.fields([
   { name: 'document', maxCount: 5 },
   { name: 'annex', maxCount: 20 },
+  // Optional PNG/JPG signatures stamped in the footer of every annexure page.
+  // Single file each — first matching field wins if duplicates posted.
+  { name: 'clientSignature', maxCount: 1 },
+  { name: 'advocateSignature', maxCount: 1 },
 ]);
 
 app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response) => {
   const fileMap = (req.files as Record<string, Express.Multer.File[]> | undefined) ?? {};
   const mainFiles = fileMap.document ?? [];
   const annexFiles = fileMap.annex ?? [];
+  const clientSig = fileMap.clientSignature?.[0];
+  const advocateSig = fileMap.advocateSignature?.[0];
   if (mainFiles.length === 0) {
     res.status(400).json({ ok: false, error: 'No file uploaded' });
     return;
@@ -164,8 +170,9 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
 
   const mainPaths = mainFiles.map((f) => f.path);
   const annexPaths = annexFiles.map((f) => f.path);
+  const sigPaths = [clientSig?.path, advocateSig?.path].filter(Boolean) as string[];
   const cleanup = () => {
-    for (const p of [...mainPaths, ...annexPaths]) fs.unlink(p, () => {});
+    for (const p of [...mainPaths, ...annexPaths, ...sigPaths]) fs.unlink(p, () => {});
   };
 
   const rawIndexEnd = (req.body?.indexEndPage ?? '0') as string;
@@ -174,15 +181,26 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
 
   const mainNames = mainFiles.map((f) => f.originalname).join(' + ');
   const annexSummary = annexFiles.length ? ` + ${annexFiles.length} annex` : '';
+  const sigSummary = [
+    clientSig ? 'client-sig' : null,
+    advocateSig ? 'advocate-sig' : null,
+  ]
+    .filter(Boolean)
+    .join('+');
   const totalMB =
-    [...mainFiles, ...annexFiles].reduce((acc, f) => acc + f.size, 0) / 1024 / 1024;
+    [...mainFiles, ...annexFiles, ...(clientSig ? [clientSig] : []), ...(advocateSig ? [advocateSig] : [])].reduce(
+      (acc, f) => acc + f.size,
+      0,
+    ) / 1024 / 1024;
   console.log(
-    `[write-pagination] ${mainFiles.length} main(s): ${mainNames}${annexSummary} (${totalMB.toFixed(1)}MB) — indexEndPage=${indexEndPage}`,
+    `[write-pagination] ${mainFiles.length} main(s): ${mainNames}${annexSummary}${sigSummary ? ' + ' + sigSummary : ''} (${totalMB.toFixed(1)}MB) — indexEndPage=${indexEndPage}`,
   );
 
   const args = [join(__dirname, 'server', 'error_detector.py')];
   for (const p of mainPaths) args.push('--file', p);
   for (const p of annexPaths) args.push('--annex', p);
+  if (clientSig) args.push('--client-sig', clientSig.path);
+  if (advocateSig) args.push('--advocate-sig', advocateSig.path);
   args.push('--index-end-page', String(indexEndPage));
   args.push('--mode', 'write');
   args.push('--write-stdout');

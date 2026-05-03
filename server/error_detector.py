@@ -505,18 +505,25 @@ def check_rule_pagination(pages: list, index_end_page: int) -> dict:
 # =============================================================================
 
 def stamp_annexure_label(page, label: str) -> None:
-    """Stamp `label` (e.g. "Annexure A-1") horizontally centered near the top
-    of the given page. Bold, large, black."""
+    """Stamp `label` (e.g. "Annexure A-1") horizontally centered at the very
+    top of the page, just below the top-right page-number band. Bold, large,
+    black.
+
+    Geometry: page-number digit lives in y∈[28, 44]. Annexure baseline is
+    placed at y=40 → visible glyph spans roughly y=17..47, sitting on the
+    same top header line as the page-number digit. Horizontally separated:
+    digit is at x≈552, label is centered around x≈300 on a 595pt-wide page.
+    """
     if not fitz:
         return
     FONTSIZE = 22
     FONTNAME = "hebo"  # Helvetica-Bold (PyMuPDF built-in)
-    Y_FROM_TOP = 110   # pt — clear of the top-right page-number zone
+    Y_BASELINE = 40    # pt from top of page — sits at the very top header band
 
     text_w = fitz.get_text_length(label, fontsize=FONTSIZE, fontname=FONTNAME)
     x = (page.rect.width - text_w) / 2
     page.insert_text(
-        fitz.Point(x, Y_FROM_TOP),
+        fitz.Point(x, Y_BASELINE),
         label,
         fontsize=FONTSIZE,
         fontname=FONTNAME,
@@ -524,20 +531,160 @@ def stamp_annexure_label(page, label: str) -> None:
     )
 
 
+def _fit_rect_to_image(image_path: str, x_left: float, y_top: float,
+                       max_w: float, max_h: float) -> Optional["fitz.Rect"]:
+    """Compute a rect that exactly preserves the image's natural aspect
+    ratio inside the (max_w, max_h) bounding box. Returns None if the
+    image can't be read.
+
+    PyMuPDF's keep_proportion will silently letterbox an image inside a
+    mismatched rect — but the visible bbox of the inserted image still
+    becomes the larger rect, which makes our overlap accounting wrong and
+    makes square stamps look small relative to wide signatures. By
+    pre-sizing the rect to match the image exactly, the on-page result
+    matches the source 1:1.
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        # Fall back to a square rect — better than nothing.
+        side = min(max_w, max_h)
+        return fitz.Rect(x_left, y_top, x_left + side, y_top + side)
+
+    try:
+        with PILImage.open(image_path) as img:
+            iw, ih = img.size
+    except Exception as e:
+        print(f"  could not read image {image_path}: {e}", file=sys.stderr)
+        return None
+
+    if iw <= 0 or ih <= 0:
+        return None
+    aspect = iw / ih
+
+    # Fit by height first, then constrain width if it overflows.
+    h = max_h
+    w = h * aspect
+    if w > max_w:
+        w = max_w
+        h = w / aspect
+    return fitz.Rect(x_left, y_top, x_left + w, y_top + h)
+
+
+def stamp_signatures_on_page(
+    page,
+    client_sig_path: Optional[str],
+    advocate_sig_path: Optional[str],
+) -> None:
+    """Stamp client signature (left) and advocate signature (right) in the
+    page footer with the image's NATIVE aspect ratio preserved.
+
+    Each signature is sized to fit within an 180×100pt bounding box; the
+    actual rect is computed per-image so a 1:1 notary stamp lands as a
+    100×100 square (not stretched into a 180×100 oval) and a wide cursive
+    signature fills the 180-wide budget at its natural ratio.
+
+    Overlap protection: scans existing text spans on the page; if the
+    default footer would clash, the sigs are pushed up to sit just below
+    the lowest text line.
+    """
+    if not fitz:
+        return
+    if not client_sig_path and not advocate_sig_path:
+        return
+
+    SIG_MAX_W = 180      # bounding box width
+    SIG_MAX_H = 100      # bounding box height
+    LEFT_MARGIN = 60     # pt from left edge for client sig
+    RIGHT_MARGIN = 60    # pt from right edge for advocate sig
+    BOTTOM_MARGIN = 30   # pt from page bottom to base of sig area
+    TEXT_BUFFER = 12     # gap between lowest text and top of sig
+
+    page_w = page.rect.width
+    page_h = page.rect.height
+
+    # Find the lowest existing text-span y. Sigs go below this line.
+    max_text_y = 0.0
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                _, _, _, y1 = span["bbox"]
+                if y1 > max_text_y:
+                    max_text_y = y1
+
+    # Top of the bounding box.
+    default_top = page_h - BOTTOM_MARGIN - SIG_MAX_H
+    sig_top = default_top
+    if max_text_y + TEXT_BUFFER > sig_top:
+        sig_top = max_text_y + TEXT_BUFFER
+
+    # Bail if no room.
+    if sig_top + SIG_MAX_H > page_h - 5:
+        print(
+            f"  warning: page has no room for signatures (max_text_y={max_text_y:.0f}, "
+            f"page_h={page_h:.0f}); skipping",
+            file=sys.stderr,
+        )
+        return
+
+    # Client (left). Compute exact rect that matches the image's aspect.
+    if client_sig_path:
+        rect = _fit_rect_to_image(client_sig_path, LEFT_MARGIN, sig_top,
+                                  SIG_MAX_W, SIG_MAX_H)
+        if rect:
+            try:
+                page.insert_image(rect, filename=client_sig_path, keep_proportion=True)
+            except Exception as e:
+                print(f"  client sig insert failed: {e}", file=sys.stderr)
+
+    # Advocate (right). Right-edge anchored at (page_w - RIGHT_MARGIN).
+    if advocate_sig_path:
+        # We need to right-align: rect width depends on image aspect, so
+        # compute it first, then offset x_left so the rect's right edge
+        # lands on the desired anchor.
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(advocate_sig_path) as img:
+                iw, ih = img.size
+            aspect = iw / ih if ih else 1.0
+        except Exception:
+            aspect = 1.0
+        h = SIG_MAX_H
+        w = h * aspect
+        if w > SIG_MAX_W:
+            w = SIG_MAX_W
+            h = w / aspect
+        right_x = page_w - RIGHT_MARGIN - w
+        rect = fitz.Rect(right_x, sig_top, right_x + w, sig_top + h)
+        try:
+            page.insert_image(rect, filename=advocate_sig_path, keep_proportion=True)
+        except Exception as e:
+            print(f"  advocate sig insert failed: {e}", file=sys.stderr)
+
+
 def append_annexures_to_pdf(
     base_path: str,
     annexure_paths: list,
     output_path: str,
+    client_sig_path: Optional[str] = None,
+    advocate_sig_path: Optional[str] = None,
 ) -> bool:
     """Append each annexure file to base_path with a centered "Annexure A-N"
     label stamped on the annexure's first page. N is sequential starting at 1.
+
+    If client_sig_path and/or advocate_sig_path are provided, signatures are
+    stamped in the footer of EVERY page of every annexure (court-filing
+    convention — every annexure page carries client+advocate signatures).
+    Existing text on each page is detected and signatures are nudged up to
+    avoid visual overlap.
 
     Returns True on success.
     """
     if not fitz:
         return False
     if not annexure_paths:
-        # No annexures to append — just copy base to output.
         try:
             doc = fitz.open(base_path)
             doc.save(output_path)
@@ -555,9 +702,17 @@ def append_annexures_to_pdf(
             if len(annex) == 0:
                 annex.close()
                 continue
-            # Stamp on the annexure's own first page BEFORE appending,
-            # otherwise we'd have to track the offset into the merged doc.
+
+            # Cover-page header label.
             stamp_annexure_label(annex[0], label)
+
+            # Footer signatures on every page of this annexure.
+            if client_sig_path or advocate_sig_path:
+                for p_idx in range(len(annex)):
+                    stamp_signatures_on_page(
+                        annex[p_idx], client_sig_path, advocate_sig_path,
+                    )
+
             out.insert_pdf(annex)
             annex.close()
             print(f"  appended annexure {idx}: {os.path.basename(path)} (label '{label}')",
@@ -898,6 +1053,14 @@ def main():
                              "as one annexure: 'Annexure A-1' is stamped on file 1's first page, "
                              "'Annexure A-2' on file 2's, etc. Annexures are appended after the "
                              "merged main PDF and pagination continues across them.")
+    parser.add_argument("--client-sig", default=None,
+                        help="Path to a PNG/JPG of the client's signature. Stamped in the "
+                             "bottom-LEFT footer of every page of every annexure. Overlap-aware: "
+                             "shifts up if the page already has text near the bottom.")
+    parser.add_argument("--advocate-sig", default=None,
+                        help="Path to a PNG/JPG of the advocate's signature. Stamped in the "
+                             "bottom-RIGHT footer of every page of every annexure (same overlap "
+                             "rules as --client-sig).")
     parser.add_argument("--index-end-page", type=int, default=0,
                         help="1-indexed last page of the index. Pages 1..N are skipped from "
                              "the pagination check (0 = no skip).")
@@ -920,6 +1083,10 @@ def main():
     if args.annex and args.mode != "write":
         parser.error("--annex currently only works with --mode write")
 
+    if (args.client_sig or args.advocate_sig) and not args.annex:
+        parser.error("--client-sig / --advocate-sig require at least one --annex (signatures "
+                     "are stamped on annexure pages only)")
+
     # Step 1: merge all main files into one base doc.
     if len(args.file) == 1:
         merged_path = args.file[0]
@@ -932,15 +1099,26 @@ def main():
         merged_path = tmp.name
         print(f"Merged {len(args.file)} PDFs -> {merged_path}", file=sys.stderr)
 
-    # Step 2: optionally append annexures (each file = one annexure).
+    # Step 2: optionally append annexures (each file = one annexure) and
+    # optionally stamp client/advocate signatures on every annexure page.
     if args.annex:
         with_annex = tempfile.NamedTemporaryFile(suffix="_with_annex.pdf", delete=False)
         with_annex.close()
-        if not append_annexures_to_pdf(merged_path, args.annex, with_annex.name):
+        if not append_annexures_to_pdf(
+            merged_path, args.annex, with_annex.name,
+            client_sig_path=args.client_sig,
+            advocate_sig_path=args.advocate_sig,
+        ):
             print(json.dumps({"ok": False, "error": "Failed to append annexures"}))
             return
         target_path = with_annex.name
-        print(f"Appended {len(args.annex)} annexure(s) -> {target_path}", file=sys.stderr)
+        sig_note = ""
+        if args.client_sig or args.advocate_sig:
+            parts = []
+            if args.client_sig: parts.append("client")
+            if args.advocate_sig: parts.append("advocate")
+            sig_note = f" with {'+'.join(parts)} sig"
+        print(f"Appended {len(args.annex)} annexure(s){sig_note} -> {target_path}", file=sys.stderr)
     else:
         target_path = merged_path
 
