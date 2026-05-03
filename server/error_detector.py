@@ -498,6 +498,80 @@ def check_rule_pagination(pages: list, index_end_page: int) -> dict:
 
 
 # =============================================================================
+# Annexure labelling — stamp "Annexure A-N" centered near the top of each
+# annexure file's first page. Used by the post-pagination "merge annexures"
+# step. Each uploaded annexure file becomes one annexure (file 1 → A-1,
+# file 2 → A-2, …) per the agreed UX.
+# =============================================================================
+
+def stamp_annexure_label(page, label: str) -> None:
+    """Stamp `label` (e.g. "Annexure A-1") horizontally centered near the top
+    of the given page. Bold, large, black."""
+    if not fitz:
+        return
+    FONTSIZE = 22
+    FONTNAME = "hebo"  # Helvetica-Bold (PyMuPDF built-in)
+    Y_FROM_TOP = 110   # pt — clear of the top-right page-number zone
+
+    text_w = fitz.get_text_length(label, fontsize=FONTSIZE, fontname=FONTNAME)
+    x = (page.rect.width - text_w) / 2
+    page.insert_text(
+        fitz.Point(x, Y_FROM_TOP),
+        label,
+        fontsize=FONTSIZE,
+        fontname=FONTNAME,
+        color=(0, 0, 0),
+    )
+
+
+def append_annexures_to_pdf(
+    base_path: str,
+    annexure_paths: list,
+    output_path: str,
+) -> bool:
+    """Append each annexure file to base_path with a centered "Annexure A-N"
+    label stamped on the annexure's first page. N is sequential starting at 1.
+
+    Returns True on success.
+    """
+    if not fitz:
+        return False
+    if not annexure_paths:
+        # No annexures to append — just copy base to output.
+        try:
+            doc = fitz.open(base_path)
+            doc.save(output_path)
+            doc.close()
+            return True
+        except Exception as e:
+            print(f"append_annexures: copy failed: {e}", file=sys.stderr)
+            return False
+
+    try:
+        out = fitz.open(base_path)
+        for idx, path in enumerate(annexure_paths, start=1):
+            label = f"Annexure A-{idx}"
+            annex = fitz.open(path)
+            if len(annex) == 0:
+                annex.close()
+                continue
+            # Stamp on the annexure's own first page BEFORE appending,
+            # otherwise we'd have to track the offset into the merged doc.
+            stamp_annexure_label(annex[0], label)
+            out.insert_pdf(annex)
+            annex.close()
+            print(f"  appended annexure {idx}: {os.path.basename(path)} (label '{label}')",
+                  file=sys.stderr)
+
+        out.save(output_path, garbage=3, deflate=True)
+        out.close()
+        return True
+    except Exception as e:
+        print(f"append_annexures error: {e}", file=sys.stderr)
+        return False
+
+
+# =============================================================================
 # Write pagination — print "1, 2, 3, …" in top-right of each post-index page
 # =============================================================================
 
@@ -538,22 +612,28 @@ def write_pagination(input_path: str, output_path: str, index_end_page: int) -> 
         TOP_MARGIN = 28    # pt from top edge to baseline-ish
         RIGHT_MARGIN = 36  # pt from right edge to right-most glyph
 
+        # Pass 1: mark every post-index page's top-right zone for redaction.
+        # A white-filled draw_rect would only HIDE the existing text — the
+        # original spans would still live in the content stream and our
+        # detector would happily read them. add_redact_annot + apply_redactions
+        # actually deletes any text whose bbox intersects the zone, then
+        # paints the zone white. We must batch these per page and apply once
+        # because apply_redactions invalidates page objects.
+        for i in range(index_end_page, total):
+            page = doc[i]
+            w = page.rect.width
+            h = page.rect.height
+            mask = fitz.Rect(w * 0.75, 0, w, h * 0.06)
+            page.add_redact_annot(mask, fill=(1, 1, 1))
+            page.apply_redactions()
+
+        # Pass 2: stamp the fresh digit on each cleaned page.
         for i in range(index_end_page, total):
             page = doc[i]
             number = i - index_end_page + 1
             text = str(number)
-
             w = page.rect.width
-            h = page.rect.height
 
-            # 1. Mask the entire top-right zone with white. Sized to cover
-            #    the detector's reading region (top 6% × right 25%) — this
-            #    way any pre-existing digit in the corner is wiped before
-            #    we stamp the new one.
-            mask = fitz.Rect(w * 0.75, 0, w, h * 0.06)
-            page.draw_rect(mask, color=None, fill=(1, 1, 1))
-
-            # 2. Stamp the new digit, right-aligned within the masked zone.
             text_width = fitz.get_text_length(text, fontsize=FONTSIZE, fontname=FONTNAME)
             x = w - RIGHT_MARGIN - text_width
             y = TOP_MARGIN
@@ -813,27 +893,73 @@ def main():
     parser = argparse.ArgumentParser(description="Appeal Document Scanner")
     parser.add_argument("--file", action="append",
                         help="Path to PDF (repeat for multiple volumes, processed in order)")
+    parser.add_argument("--annex", action="append",
+                        help="Path to an annexure PDF (repeat for multiple). Each file is treated "
+                             "as one annexure: 'Annexure A-1' is stamped on file 1's first page, "
+                             "'Annexure A-2' on file 2's, etc. Annexures are appended after the "
+                             "merged main PDF and pagination continues across them.")
     parser.add_argument("--index-end-page", type=int, default=0,
                         help="1-indexed last page of the index. Pages 1..N are skipped from "
                              "the pagination check (0 = no skip).")
     parser.add_argument("--mode", choices=("detect", "write", "both"), default="detect",
                         help="detect: rule check only. write: stamp page numbers only "
                              "(skips text extraction + rules — much faster). both: do both.")
+    parser.add_argument("--write-stdout", action="store_true",
+                        help="Stream the numbered PDF as raw bytes on stdout instead of "
+                             "embedding base64 in JSON. Only valid with --mode write. "
+                             "Used by the streaming HTTP route to avoid the ~33%% base64 "
+                             "inflation and JSON parsing overhead.")
     args = parser.parse_args()
 
     if not args.file:
         parser.error("at least one --file is required")
 
+    if args.write_stdout and args.mode != "write":
+        parser.error("--write-stdout requires --mode write")
+
+    if args.annex and args.mode != "write":
+        parser.error("--annex currently only works with --mode write")
+
+    # Step 1: merge all main files into one base doc.
     if len(args.file) == 1:
-        target_path = args.file[0]
+        merged_path = args.file[0]
     else:
         tmp = tempfile.NamedTemporaryFile(suffix="_merged.pdf", delete=False)
         tmp.close()
         if not merge_pdfs(args.file, tmp.name):
             print(json.dumps({"ok": False, "error": "Failed to merge input PDFs"}))
             return
-        target_path = tmp.name
-        print(f"Merged {len(args.file)} PDFs -> {target_path}", file=sys.stderr)
+        merged_path = tmp.name
+        print(f"Merged {len(args.file)} PDFs -> {merged_path}", file=sys.stderr)
+
+    # Step 2: optionally append annexures (each file = one annexure).
+    if args.annex:
+        with_annex = tempfile.NamedTemporaryFile(suffix="_with_annex.pdf", delete=False)
+        with_annex.close()
+        if not append_annexures_to_pdf(merged_path, args.annex, with_annex.name):
+            print(json.dumps({"ok": False, "error": "Failed to append annexures"}))
+            return
+        target_path = with_annex.name
+        print(f"Appended {len(args.annex)} annexure(s) -> {target_path}", file=sys.stderr)
+    else:
+        target_path = merged_path
+
+    # Streaming fast-path: write the numbered PDF directly to stdout. Skips
+    # base64, skips JSON, skips the merged_pdf passthrough — server.ts pipes
+    # this straight to the HTTP response.
+    if args.write_stdout:
+        out_tmp = tempfile.NamedTemporaryFile(suffix="_numbered.pdf", delete=False)
+        out_tmp.close()
+        if not write_pagination(target_path, out_tmp.name, args.index_end_page):
+            print("write_pagination failed", file=sys.stderr)
+            sys.exit(1)
+        with open(out_tmp.name, "rb") as f:
+            sys.stdout.buffer.write(f.read())
+        try:
+            os.unlink(out_tmp.name)
+        except OSError:
+            pass
+        return
 
     report = run_full_analysis(target_path, args.index_end_page, args.mode)
     if len(args.file) > 1:
