@@ -1,5 +1,7 @@
 # Nomikos Backend (`NO-MO-KOS-BACK`)
 
+> **Live:** https://no-mi-kos-back.onrender.com · `GET /api/health` returns OK when the service is awake.
+
 Express HTTP layer + Python PDF engine. The PDF heavy-lifting (redaction,
 stamping, merging, OCR) lives in the Python modules under `server/`; the
 TypeScript file `server.ts` is a thin adapter that routes multipart
