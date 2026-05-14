@@ -16,9 +16,13 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const app = express();
 const PORT = process.env.PORT ?? 3001;
 
+// Per-file upload cap. Matches the nginx `client_max_body_size 500m`
+// fronting the static / proxy layer — going higher here is pointless because
+// nginx would reject first. Disk storage is used (see `dest`) so a 500MB
+// upload does not consume 500MB of process memory.
 const upload = multer({
   dest: UPLOAD_DIR,
-  limits: { fileSize: 100 * 1024 * 1024 },
+  limits: { fileSize: 500 * 1024 * 1024 },
 });
 
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
