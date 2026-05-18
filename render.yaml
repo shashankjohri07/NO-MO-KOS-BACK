@@ -1,4 +1,6 @@
 services:
+  # Web API — accepts uploads, enqueues jobs, serves status. Light memory:
+  # it only streams the upload to object storage + talks to Redis.
   - type: web
     name: no-mi-kos-back
     runtime: docker
@@ -8,3 +10,40 @@ services:
     envVars:
       - key: PORT
         value: 3001
+      # Set in the Render dashboard (sync:false = not committed):
+      - key: REDIS_URL
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+
+  # Worker — consumes the queue and runs the heavy PDF pipeline. This is the
+  # memory/CPU-bound service; give it the paid plan. Scale by raising
+  # WORKER_CONCURRENCY (2 is safe on 2GB Standard) or adding instances.
+  - type: worker
+    name: no-mi-kos-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: standard
+    dockerCommand: npx tsx src/worker.ts
+    envVars:
+      - key: WORKER_CONCURRENCY
+        value: 2
+      - key: REDIS_URL
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
