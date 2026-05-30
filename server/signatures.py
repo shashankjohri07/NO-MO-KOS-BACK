@@ -89,6 +89,46 @@ def _project_to_mediabox(page, visible_rect: "fitz.Rect") -> "fitz.Rect":
     )
 
 
+def _draw_white_card(page, visible_rect: "fitz.Rect", padding: float = 4.0) -> None:
+    """Stamp a small opaque white rectangle with a thin gray border at
+    `visible_rect` (plus `padding` on every side). Drawn BEFORE the
+    signature image so the user's sig — even when scanned with a
+    transparent background — pops cleanly off any underlying text,
+    notary seal, or registry stamp instead of being washed out.
+
+    Court convention treats the signature as the canonical mark; the
+    card around it is consistent with how attorneys stick signature
+    labels onto filed copies.
+    """
+    if not fitz:
+        return
+    card_visible = fitz.Rect(
+        visible_rect.x0 - padding,
+        visible_rect.y0 - padding,
+        visible_rect.x1 + padding,
+        visible_rect.y1 + padding,
+    )
+    # Clamp to page bounds so the rect never escapes the visible area.
+    page_rect = page.rect
+    card_visible = fitz.Rect(
+        max(0, card_visible.x0),
+        max(0, card_visible.y0),
+        min(page_rect.width, card_visible.x1),
+        min(page_rect.height, card_visible.y1),
+    )
+    card_mediabox = _project_to_mediabox(page, card_visible)
+    try:
+        page.draw_rect(
+            card_mediabox,
+            color=(0.7, 0.7, 0.7),   # thin gray border for definition
+            fill=(1, 1, 1),           # opaque white background
+            width=0.5,
+            fill_opacity=1.0,
+        )
+    except Exception as e:
+        print(f"  white card draw failed: {e}", file=sys.stderr)
+
+
 def stamp_signatures_on_page(
     page,
     client_sig_path: Optional[str],
@@ -186,6 +226,8 @@ def stamp_signatures_on_page(
                 client_sig_path, LEFT_MARGIN, sig_top, SIG_MAX_W, SIG_MAX_H,
             )
             if visible_rect:
+                # Card first (so sig draws ON TOP), then sig.
+                _draw_white_card(page, visible_rect)
                 mediabox_rect = _project_to_mediabox(page, visible_rect)
                 try:
                     page.insert_image(
@@ -219,6 +261,8 @@ def stamp_signatures_on_page(
             h = w / aspect
         right_x = page_w - RIGHT_MARGIN - w
         visible_rect = fitz.Rect(right_x, sig_top, right_x + w, sig_top + h)
+        # Card first, then sig on top.
+        _draw_white_card(page, visible_rect)
         mediabox_rect = _project_to_mediabox(page, visible_rect)
         try:
             page.insert_image(
