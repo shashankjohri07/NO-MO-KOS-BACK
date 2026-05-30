@@ -119,10 +119,24 @@ def append_annexures_to_pdf(
 
                 # Footer signatures on every page of this annexure.
                 if client_sig_path or advocate_sig_path:
+                    sides = []
+                    if client_sig_path: sides.append("client")
+                    if advocate_sig_path: sides.append("advocate")
+                    print(
+                        f"  stamping {'+'.join(sides)} sig on {len(annex)} "
+                        f"page(s) of {os.path.basename(path)}",
+                        file=sys.stderr,
+                    )
                     for p_idx in range(len(annex)):
                         stamp_signatures_on_page(
                             annex[p_idx], client_sig_path, advocate_sig_path,
                         )
+                else:
+                    print(
+                        f"  no sig paths passed — skipping signature stamping "
+                        f"on {os.path.basename(path)}",
+                        file=sys.stderr,
+                    )
 
                 out.insert_pdf(annex)
             finally:

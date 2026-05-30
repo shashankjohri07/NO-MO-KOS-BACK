@@ -6,17 +6,12 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "tsx server.ts",
-    "worker": "tsx src/worker.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1048.0",
-    "@aws-sdk/s3-request-presigner": "^3.1048.0",
-    "bullmq": "^5.76.10",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
-    "ioredis": "^5.10.1",
     "multer": "^2.1.1"
   },
   "devDependencies": {

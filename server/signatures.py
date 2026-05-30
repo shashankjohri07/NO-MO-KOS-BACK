@@ -116,8 +116,11 @@ def stamp_signatures_on_page(
     if not client_sig_path and not advocate_sig_path:
         return
 
-    SIG_MAX_W = 180
-    SIG_MAX_H = 100
+    # Sized for legal filings — visible but never dominant. Court convention
+    # is that the sig sits cleanly in the footer; squeezing the box keeps it
+    # out of pre-existing notary seals and page-bottom registry stamps.
+    SIG_MAX_W = 120
+    SIG_MAX_H = 60
     LEFT_MARGIN = 60
     RIGHT_MARGIN = 60
     BOTTOM_MARGIN = 30
@@ -171,27 +174,42 @@ def stamp_signatures_on_page(
 
     # Client (left)
     if client_sig_path:
-        visible_rect = _fit_visible_rect_to_image(
-            client_sig_path, LEFT_MARGIN, sig_top, SIG_MAX_W, SIG_MAX_H,
-        )
-        if visible_rect:
-            mediabox_rect = _project_to_mediabox(page, visible_rect)
-            try:
-                page.insert_image(
-                    mediabox_rect,
-                    filename=client_sig_path,
-                    keep_proportion=True,
-                    rotate=rotation,
-                )
-            except Exception as e:
-                print(
-                    f"  client sig insert failed (rotation={rotation}): {e}",
-                    file=sys.stderr,
-                )
+        import os as _os
+        if not _os.path.exists(client_sig_path):
+            print(
+                f"  client sig file missing on disk: {client_sig_path}",
+                file=sys.stderr,
+            )
+        else:
+            visible_rect = _fit_visible_rect_to_image(
+                client_sig_path, LEFT_MARGIN, sig_top, SIG_MAX_W, SIG_MAX_H,
+            )
+            if visible_rect:
+                mediabox_rect = _project_to_mediabox(page, visible_rect)
+                try:
+                    page.insert_image(
+                        mediabox_rect,
+                        filename=client_sig_path,
+                        keep_proportion=True,
+                        rotate=rotation,
+                    )
+                except Exception as e:
+                    print(
+                        f"  client sig insert failed "
+                        f"(rotation={rotation}, rect={mediabox_rect}): {e}",
+                        file=sys.stderr,
+                    )
 
     # Advocate (right). Right-edge anchored — compute width first in
     # visible coords, then project to mediabox.
     if advocate_sig_path:
+        import os as _os
+        if not _os.path.exists(advocate_sig_path):
+            print(
+                f"  advocate sig file missing on disk: {advocate_sig_path}",
+                file=sys.stderr,
+            )
+            return
         aspect = _read_image_aspect(advocate_sig_path) or 1.0
         h = SIG_MAX_H
         w = h * aspect
@@ -210,6 +228,7 @@ def stamp_signatures_on_page(
             )
         except Exception as e:
             print(
-                f"  advocate sig insert failed (rotation={rotation}): {e}",
+                f"  advocate sig insert failed "
+                f"(rotation={rotation}, rect={mediabox_rect}): {e}",
                 file=sys.stderr,
             )

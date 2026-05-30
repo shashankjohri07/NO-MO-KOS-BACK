@@ -6,14 +6,6 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs';
-import { randomUUID } from 'crypto';
-import {
-  paginationQueue,
-  redisConfigured,
-  type WritePaginationJob,
-  type JobFileRef,
-} from './src/queue';
-import { uploadFile, presignGetUrl, storageConfigured } from './src/storage';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -173,155 +165,15 @@ const uploadDualFields = upload.fields([
   { name: 'advocateSignature', maxCount: 1 },
 ]);
 
-// ── Async job API ────────────────────────────────────────────────────────
-// Accepts the same multipart payload as /api/write-pagination, but instead
-// of processing inline (which ties up the dyno + risks HTTP timeout / OOM on
-// big files), it stages inputs to object storage, enqueues a BullMQ job, and
-// returns a jobId immediately. The separate worker service does the heavy
-// PDF work; the client polls GET /api/jobs/:id.
-app.post(
-  '/api/jobs/write-pagination',
-  uploadDualFields,
-  async (req: Request, res: Response) => {
-    if (!redisConfigured() || !storageConfigured()) {
-      res.status(503).json({
-        ok: false,
-        error:
-          'Async pipeline not configured (REDIS_URL / R2_* env missing). Use /api/write-pagination.',
-      });
-      return;
-    }
-
-    const fileMap = (req.files as Record<string, Express.Multer.File[]> | undefined) ?? {};
-    const mainFiles = fileMap.document ?? [];
-    const annexFiles = fileMap.annex ?? [];
-    const clientSig = fileMap.clientSignature?.[0];
-    const advocateSig = fileMap.advocateSignature?.[0];
-
-    const allLocal = [
-      ...mainFiles,
-      ...annexFiles,
-      ...(clientSig ? [clientSig] : []),
-      ...(advocateSig ? [advocateSig] : []),
-    ];
-    const cleanupLocal = () => {
-      for (const f of allLocal) fs.unlink(f.path, () => {});
-    };
-
-    if (mainFiles.length === 0) {
-      cleanupLocal();
-      res.status(400).json({ ok: false, error: 'No file uploaded' });
-      return;
-    }
-
-    const rawIndexEnd = (req.body?.indexEndPage ?? '0') as string;
-    const parsedIndexEnd = Number.parseInt(rawIndexEnd, 10);
-    const indexEndPage =
-      Number.isFinite(parsedIndexEnd) && parsedIndexEnd >= 0 ? parsedIndexEnd : 0;
-
-    // `signPages` is the optional "also sign these MAIN pages" spec.
-    // Server-side validation happens in the Python CLI (parser raises
-    // on malformed input and the worker surfaces it as a job failure);
-    // here we just cap absurd lengths so a 1MB form field can't reach
-    // the spawn process unchallenged.
-    const rawSignPages = (req.body?.signPages ?? '') as string;
-    const signPages =
-      typeof rawSignPages === 'string' && rawSignPages.length <= 500
-        ? rawSignPages.trim()
-        : '';
-
-    const jobId = randomUUID();
-    const prefix = `jobs/${jobId}`;
-
-    try {
-      const stage = async (
-        f: Express.Multer.File,
-        kind: string,
-        i: number,
-      ): Promise<JobFileRef> => {
-        const key = `${prefix}/in/${kind}-${i}-${f.originalname.replace(/[^\w.-]/g, '_')}`;
-        await uploadFile(key, f.path, f.mimetype || 'application/octet-stream');
-        return { key, originalName: f.originalname };
-      };
-
-      const main: JobFileRef[] = [];
-      for (let i = 0; i < mainFiles.length; i++) main.push(await stage(mainFiles[i], 'main', i));
-      const annex: JobFileRef[] = [];
-      for (let i = 0; i < annexFiles.length; i++)
-        annex.push(await stage(annexFiles[i], 'annex', i));
-      const clientRef = clientSig ? await stage(clientSig, 'csig', 0) : undefined;
-      const advocateRef = advocateSig ? await stage(advocateSig, 'asig', 0) : undefined;
-
-      const baseName = mainFiles[0].originalname.replace(/\.pdf$/i, '') || 'document';
-      const downloadName = annexFiles.length
-        ? `NUMBERED_WITH_ANNEXURES_${baseName}.pdf`
-        : `NUMBERED_${baseName}.pdf`;
-
-      const payload: WritePaginationJob = {
-        main,
-        annex,
-        clientSig: clientRef,
-        advocateSig: advocateRef,
-        indexEndPage,
-        ...(signPages ? { signPages } : {}),
-        outputKey: `${prefix}/out/${downloadName}`,
-        downloadName,
-      };
-
-      const job = await paginationQueue().add('write-pagination', payload, { jobId });
-      cleanupLocal();
-      console.log(
-        `[jobs] queued ${jobId} — ${main.length} main + ${annex.length} annex, ` +
-          `indexEnd=${indexEndPage}${signPages ? `, signPages='${signPages}'` : ''}`,
-      );
-      res.status(202).json({ ok: true, jobId: job.id });
-    } catch (err) {
-      cleanupLocal();
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[jobs] enqueue failed: ${message}`);
-      res.status(500).json({ ok: false, error: message });
-    }
-  },
-);
-
-app.get('/api/jobs/:id', async (req: Request, res: Response) => {
-  if (!redisConfigured()) {
-    res.status(503).json({ ok: false, error: 'Async pipeline not configured' });
-    return;
-  }
-  try {
-    const jobId = String(req.params.id);
-    const job = await paginationQueue().getJob(jobId);
-    if (!job) {
-      res.status(404).json({ ok: false, error: 'Job not found or expired' });
-      return;
-    }
-    const state = await job.getState();
-    const progress = typeof job.progress === 'number' ? job.progress : 0;
-
-    if (state === 'completed') {
-      const result = job.returnvalue as { outputKey: string; downloadName: string };
-      const url = await presignGetUrl(result.outputKey, 3600);
-      res.json({
-        ok: true,
-        state,
-        progress: 100,
-        resultUrl: url,
-        downloadName: result.downloadName,
-      });
-      return;
-    }
-    if (state === 'failed') {
-      res.json({ ok: false, state, error: job.failedReason || 'Processing failed' });
-      return;
-    }
-    res.json({ ok: true, state, progress });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(500).json({ ok: false, error: message });
-  }
-});
-
+// ── Single inline endpoint ────────────────────────────────────────────────
+// Accepts a multipart payload (main PDFs, annexures, optional signatures,
+// indexEndPage, optional signPages spec), spawns the Python pipeline, and
+// streams the produced PDF directly back as the response body.
+//
+// No queue, no object storage, no polling — the web dyno does the work
+// itself. Render's `client_max_body_size` and the multer `limits.fileSize`
+// gate the upload size; Python timing is bounded by the 10-minute spawn
+// timeout below.
 app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response) => {
   const fileMap = (req.files as Record<string, Express.Multer.File[]> | undefined) ?? {};
   const mainFiles = fileMap.document ?? [];
