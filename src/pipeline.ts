@@ -15,6 +15,8 @@ export interface PipelineInput {
   clientSigPath?: string;
   advocateSigPath?: string;
   indexEndPage: number;
+  /** Optional --sign-pages spec passed through to error_detector.py. */
+  signPages?: string;
   // Local path the finished PDF is written to.
   outputPath: string;
 }
@@ -31,6 +33,9 @@ export function runWritePagination(input: PipelineInput): Promise<void> {
     if (input.clientSigPath) args.push('--client-sig', input.clientSigPath);
     if (input.advocateSigPath) args.push('--advocate-sig', input.advocateSigPath);
     args.push('--index-end-page', String(input.indexEndPage));
+    if (input.signPages && input.signPages.trim()) {
+      args.push('--sign-pages', input.signPages.trim());
+    }
     args.push('--mode', 'write');
     args.push('--write-stdout');
 

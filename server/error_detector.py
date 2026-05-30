@@ -50,6 +50,7 @@ from rules import check_rule_doc_upload  # noqa: E402
 from annotated_pdf import generate_annotated_pdf  # noqa: E402
 from annexures import append_annexures_to_pdf  # noqa: E402
 from merge import merge_pdfs  # noqa: E402
+from page_spec import parse_page_spec, format_page_set, PageSpecError  # noqa: E402
 
 
 # =============================================================================
@@ -224,6 +225,13 @@ def main():
     parser.add_argument("--index-end-page", type=int, default=0,
                         help="1-indexed last page of the index. Pages 1..N are skipped from "
                              "the pagination check (0 = no skip).")
+    parser.add_argument("--sign-pages", default=None,
+                        help="Optional comma+range spec listing additional MAIN-document "
+                             "pages (by their stamped page number, NOT physical position) "
+                             "that should also receive client/advocate signatures, e.g. "
+                             "'1, 3-5, 8, 12-15'. Annexure pages are already auto-signed "
+                             "on every page, so out-of-main-range entries are silently "
+                             "skipped. Requires --client-sig and/or --advocate-sig.")
     parser.add_argument("--mode", choices=("detect", "write", "both"), default="detect",
                         help="detect: rule check only. write: stamp page numbers only "
                              "(skips text extraction + rules — much faster). both: do both.")
@@ -243,9 +251,24 @@ def main():
     if args.annex and args.mode != "write":
         parser.error("--annex currently only works with --mode write")
 
-    if (args.client_sig or args.advocate_sig) and not args.annex:
-        parser.error("--client-sig / --advocate-sig require at least one --annex (signatures "
-                     "are stamped on annexure pages only)")
+    if (args.client_sig or args.advocate_sig) and not args.annex and not args.sign_pages:
+        parser.error("--client-sig / --advocate-sig require at least one --annex "
+                     "(auto-sign every annex page) or --sign-pages (sign listed main "
+                     "pages). Pass one or the other.")
+
+    if args.sign_pages and not (args.client_sig or args.advocate_sig):
+        parser.error("--sign-pages requires --client-sig and/or --advocate-sig.")
+
+    # Parse --sign-pages spec early so we fail fast on malformed input
+    # (before doing any PDF I/O). The set of 1-indexed stamped page
+    # numbers the user wants signed.
+    sign_page_spec: set = set()
+    if args.sign_pages:
+        try:
+            sign_page_spec = parse_page_spec(args.sign_pages)
+        except PageSpecError as e:
+            print(json.dumps({"ok": False, "error": f"Invalid --sign-pages: {e}"}))
+            return
 
     # Step 1: merge all main files into one base doc.
     if len(args.file) == 1:
@@ -258,6 +281,15 @@ def main():
             return
         merged_path = tmp.name
         print(f"Merged {len(args.file)} PDFs -> {merged_path}", file=sys.stderr)
+
+    # Snapshot the main-doc page count BEFORE appending annexures, so we
+    # can correctly bound the --sign-pages user input to the main range
+    # (annexures already get every-page signatures via append_annexures_to_pdf;
+    # we don't want to double-stamp them).
+    main_total = 0
+    if sign_page_spec and fitz:
+        with fitz.open(merged_path) as _mdoc:
+            main_total = len(_mdoc)
 
     # Step 2: optionally append annexures (each file = one annexure) and
     # optionally stamp client/advocate signatures on every annexure page.
@@ -282,13 +314,49 @@ def main():
     else:
         target_path = merged_path
 
+    # Translate the user's stamped-page numbers into 0-indexed physical
+    # page indices (the form write_pagination's extra_sig_pages set
+    # expects). Stamped number N == physical page (index_end_page + N - 1).
+    # Entries outside the main range are dropped with a stderr warning —
+    # those would have landed on annexures, which are already covered.
+    extra_sig_physical: set = set()
+    if sign_page_spec:
+        main_post_index_count = max(0, main_total - args.index_end_page)
+        kept: set = set()
+        skipped = []
+        for n in sign_page_spec:
+            if 1 <= n <= main_post_index_count:
+                kept.add(n)
+                extra_sig_physical.add(args.index_end_page + n - 1)
+            else:
+                skipped.append(n)
+        if kept:
+            print(
+                f"  extra signatures will land on stamped pages: "
+                f"{format_page_set(kept)} "
+                f"(physical {sorted(p + 1 for p in extra_sig_physical)})",
+                file=sys.stderr,
+            )
+        if skipped:
+            print(
+                f"  warning: --sign-pages entries outside main range "
+                f"(1..{main_post_index_count}) ignored: "
+                f"{format_page_set(set(skipped))}",
+                file=sys.stderr,
+            )
+
     # Streaming fast-path: write the numbered PDF directly to stdout. Skips
     # base64, skips JSON, skips the merged_pdf passthrough — server.ts
     # pipes this straight to the HTTP response.
     if args.write_stdout:
         out_tmp = tempfile.NamedTemporaryFile(suffix="_numbered.pdf", delete=False)
         out_tmp.close()
-        if not write_pagination(target_path, out_tmp.name, args.index_end_page):
+        if not write_pagination(
+            target_path, out_tmp.name, args.index_end_page,
+            extra_sig_pages=extra_sig_physical,
+            client_sig_path=args.client_sig,
+            advocate_sig_path=args.advocate_sig,
+        ):
             print("write_pagination failed", file=sys.stderr)
             sys.exit(1)
         with open(out_tmp.name, "rb") as f:

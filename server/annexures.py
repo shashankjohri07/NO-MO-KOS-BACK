@@ -10,7 +10,13 @@ page of every annexure (court-filing convention). Stamping happens on
 the source annexure document before the insert_pdf merge, mirroring the
 label flow.
 
-Pure module split from the previous monolith — no logic changes.
+Rotation handling: scanned annexure PDFs (court orders, certificates)
+often carry a /Rotate flag set to 90/180/270 — the viewer rotates them
+into portrait, but PyMuPDF's insert_text/insert_image use the unrotated
+mediabox coordinate system by default. We compensate by transforming
+visible coords through page.derotation_matrix and passing
+rotate=page.rotation so stamps appear correctly oriented at the visible
+"top" regardless of the source page's /Rotate value.
 """
 
 import os
@@ -23,8 +29,13 @@ from signatures import stamp_signatures_on_page
 
 def stamp_annexure_label(page, label: str) -> None:
     """Stamp `label` (e.g. "Annexure A-1") horizontally centered at the very
-    top of the page, sharing the top header band with the page-number digit.
-    Bold, large, black.
+    top of the page (in the page's VISIBLE orientation), sharing the top
+    header band with the page-number digit. Bold, large, black.
+
+    Works correctly on pages with non-zero /Rotate flag: visible coords
+    are projected to mediabox coords via page.derotation_matrix, and
+    rotate=page.rotation aligns the glyph orientation with the rendered
+    view.
 
     Geometry: page-number digit lives in y∈[28, 44] (top-right). Annexure
     baseline at y=40 → visible glyph spans roughly y=17..47. Horizontally
@@ -36,15 +47,31 @@ def stamp_annexure_label(page, label: str) -> None:
     FONTNAME = "hebo"  # Helvetica-Bold (PyMuPDF built-in)
     Y_BASELINE = 40
 
-    text_w = fitz.get_text_length(label, fontsize=FONTSIZE, fontname=FONTNAME)
-    x = (page.rect.width - text_w) / 2
-    page.insert_text(
-        fitz.Point(x, Y_BASELINE),
-        label,
-        fontsize=FONTSIZE,
-        fontname=FONTNAME,
-        color=(0, 0, 0),
-    )
+    try:
+        text_w = fitz.get_text_length(label, fontsize=FONTSIZE, fontname=FONTNAME)
+        # page.rect IS rotation-aware → reflects the visible page dimensions
+        visible_w = page.rect.width
+        x_visible = (visible_w - text_w) / 2
+
+        # Project visible-coord point to mediabox coord that insert_text needs.
+        # For rotation==0 this is a no-op (derotation_matrix is identity).
+        point_visible = fitz.Point(x_visible, Y_BASELINE)
+        point_mediabox = point_visible * page.derotation_matrix
+
+        page.insert_text(
+            point_mediabox,
+            label,
+            fontsize=FONTSIZE,
+            fontname=FONTNAME,
+            color=(0, 0, 0),
+            rotate=page.rotation,
+        )
+    except Exception as e:
+        print(
+            f"  stamp_annexure_label failed for '{label}' "
+            f"(rotation={getattr(page, 'rotation', '?')}): {e}",
+            file=sys.stderr,
+        )
 
 
 def append_annexures_to_pdf(

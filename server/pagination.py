@@ -14,12 +14,20 @@ Pure module split — no logic changes.
 """
 
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 from config import fitz
+from signatures import stamp_signatures_on_page
 
 
-def write_pagination(input_path: str, output_path: str, index_end_page: int) -> bool:
+def write_pagination(
+    input_path: str,
+    output_path: str,
+    index_end_page: int,
+    extra_sig_pages: Optional[Set[int]] = None,
+    client_sig_path: Optional[str] = None,
+    advocate_sig_path: Optional[str] = None,
+) -> bool:
     """Stamp sequential page numbers in the top-right corner of every page
     after the user-supplied index range.
 
@@ -30,6 +38,14 @@ def write_pagination(input_path: str, output_path: str, index_end_page: int) -> 
     is REDACTED — text spans are deleted from the content stream before
     the new digit is drawn. A plain white draw_rect would only hide them
     visually; the detector would still read the underlying spans.
+
+    Optional `extra_sig_pages` is a set of 0-indexed physical page
+    numbers that should ALSO receive client/advocate signatures during
+    this pass. The annexure-pages-every-page stamping has already
+    happened upstream in append_annexures_to_pdf; this hook lets the
+    user opt extra MAIN-document pages in (vakalatnama, prayer page,
+    affidavit) by listing them in the "sign which pages" input. Pages
+    not in this set are unaffected.
     """
     if not fitz:
         return False
@@ -45,7 +61,7 @@ def write_pagination(input_path: str, output_path: str, index_end_page: int) -> 
             )
             return False
 
-        FONTSIZE = 12
+        FONTSIZE = 14
         FONTNAME = "helv"
         TOP_MARGIN = 28
         RIGHT_MARGIN = 36
@@ -53,6 +69,10 @@ def write_pagination(input_path: str, output_path: str, index_end_page: int) -> 
         # Pass 1: redact top-right zone on every post-index page. We can't
         # interleave redactions and inserts because apply_redactions
         # invalidates page objects.
+        #
+        # Rotation note: add_redact_annot accepts coordinates in the page's
+        # CURRENT (rotation-aware) coord system, so using page.rect.width
+        # / .height directly stays correct for rotated pages.
         for i in range(index_end_page, total):
             page = doc[i]
             w = page.rect.width
@@ -62,21 +82,62 @@ def write_pagination(input_path: str, output_path: str, index_end_page: int) -> 
             page.apply_redactions()
 
         # Pass 2: stamp the fresh digit.
+        #
+        # Rotation note: insert_text uses unrotated mediabox coords by
+        # default. We compute the visible-coord position via the
+        # rotation-aware page.rect, then project through
+        # derotation_matrix and pass rotate=page.rotation so the digit
+        # always reads upright at the visible top-right — even when the
+        # source PDF carries /Rotate 90/180/270 (common with scanned
+        # court documents).
         for i in range(index_end_page, total):
             page = doc[i]
             number = i - index_end_page + 1
             text = str(number)
             w = page.rect.width
             text_width = fitz.get_text_length(text, fontsize=FONTSIZE, fontname=FONTNAME)
-            x = w - RIGHT_MARGIN - text_width
-            y = TOP_MARGIN
-            page.insert_text(
-                fitz.Point(x, y + FONTSIZE),
-                text,
-                fontsize=FONTSIZE,
-                fontname=FONTNAME,
-                color=(0, 0, 0),
-            )
+            x_visible = w - RIGHT_MARGIN - text_width
+            y_visible = TOP_MARGIN + FONTSIZE
+            point_mediabox = fitz.Point(x_visible, y_visible) * page.derotation_matrix
+            try:
+                page.insert_text(
+                    point_mediabox,
+                    text,
+                    fontsize=FONTSIZE,
+                    fontname=FONTNAME,
+                    color=(0, 0, 0),
+                    rotate=page.rotation,
+                )
+            except Exception as e:
+                print(
+                    f"  page-number stamp failed on physical page {i + 1} "
+                    f"(rotation={page.rotation}): {e}",
+                    file=sys.stderr,
+                )
+
+        # Pass 3 (optional): stamp client/advocate signatures on the
+        # user-specified pages. These are extra to whatever annexures got
+        # in append_annexures_to_pdf — they cover the "I want signatures
+        # on the prayer page / vakalatnama too" use case.
+        if extra_sig_pages and (client_sig_path or advocate_sig_path):
+            for i in sorted(extra_sig_pages):
+                if i < 0 or i >= total:
+                    print(
+                        f"  warning: extra-sig physical page {i + 1} is "
+                        f"outside document range (1..{total}); skipping",
+                        file=sys.stderr,
+                    )
+                    continue
+                try:
+                    stamp_signatures_on_page(
+                        doc[i], client_sig_path, advocate_sig_path,
+                    )
+                except Exception as e:
+                    print(
+                        f"  extra signature stamp failed on physical page "
+                        f"{i + 1}: {e}",
+                        file=sys.stderr,
+                    )
 
         doc.save(output_path, garbage=3, deflate=True)
         return True

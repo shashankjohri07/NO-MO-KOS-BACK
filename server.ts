@@ -160,9 +160,13 @@ app.post('/api/upload', upload.single('document'), (req: Request, res: Response)
 //               gets "Annexure A-1" stamped on its first page, file 2 gets
 //               "Annexure A-2", and so on, then they are appended after the
 //               main merged PDF and pagination continues across them).
+// `maxCount` is set high (not removed) because multer requires a finite
+// number — these caps exist only as a guardrail against accidental
+// mass-uploads, not as a product limit. The per-file size cap (multer
+// `limits.fileSize`) and nginx `client_max_body_size` still apply.
 const uploadDualFields = upload.fields([
-  { name: 'document', maxCount: 5 },
-  { name: 'annex', maxCount: 20 },
+  { name: 'document', maxCount: 100 },
+  { name: 'annex', maxCount: 100 },
   // Optional PNG/JPG signatures stamped in the footer of every annexure page.
   // Single file each — first matching field wins if duplicates posted.
   { name: 'clientSignature', maxCount: 1 },
@@ -215,6 +219,17 @@ app.post(
     const indexEndPage =
       Number.isFinite(parsedIndexEnd) && parsedIndexEnd >= 0 ? parsedIndexEnd : 0;
 
+    // `signPages` is the optional "also sign these MAIN pages" spec.
+    // Server-side validation happens in the Python CLI (parser raises
+    // on malformed input and the worker surfaces it as a job failure);
+    // here we just cap absurd lengths so a 1MB form field can't reach
+    // the spawn process unchallenged.
+    const rawSignPages = (req.body?.signPages ?? '') as string;
+    const signPages =
+      typeof rawSignPages === 'string' && rawSignPages.length <= 500
+        ? rawSignPages.trim()
+        : '';
+
     const jobId = randomUUID();
     const prefix = `jobs/${jobId}`;
 
@@ -248,6 +263,7 @@ app.post(
         clientSig: clientRef,
         advocateSig: advocateRef,
         indexEndPage,
+        ...(signPages ? { signPages } : {}),
         outputKey: `${prefix}/out/${downloadName}`,
         downloadName,
       };
@@ -255,7 +271,8 @@ app.post(
       const job = await paginationQueue().add('write-pagination', payload, { jobId });
       cleanupLocal();
       console.log(
-        `[jobs] queued ${jobId} — ${main.length} main + ${annex.length} annex, indexEnd=${indexEndPage}`,
+        `[jobs] queued ${jobId} — ${main.length} main + ${annex.length} annex, ` +
+          `indexEnd=${indexEndPage}${signPages ? `, signPages='${signPages}'` : ''}`,
       );
       res.status(202).json({ ok: true, jobId: job.id });
     } catch (err) {
@@ -327,6 +344,15 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   const parsedIndexEnd = Number.parseInt(rawIndexEnd, 10);
   const indexEndPage = Number.isFinite(parsedIndexEnd) && parsedIndexEnd >= 0 ? parsedIndexEnd : 0;
 
+  // Same lightweight cap on signPages as the async route. Python is the
+  // source of truth for "is this a valid spec" — we just stop a 1MB
+  // form-field bomb from being shoveled into argv.
+  const rawSignPages = (req.body?.signPages ?? '') as string;
+  const signPages =
+    typeof rawSignPages === 'string' && rawSignPages.length <= 500
+      ? rawSignPages.trim()
+      : '';
+
   const mainNames = mainFiles.map((f) => f.originalname).join(' + ');
   const annexSummary = annexFiles.length ? ` + ${annexFiles.length} annex` : '';
   const sigSummary = [
@@ -341,7 +367,7 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
       0,
     ) / 1024 / 1024;
   console.log(
-    `[write-pagination] ${mainFiles.length} main(s): ${mainNames}${annexSummary}${sigSummary ? ' + ' + sigSummary : ''} (${totalMB.toFixed(1)}MB) — indexEndPage=${indexEndPage}`,
+    `[write-pagination] ${mainFiles.length} main(s): ${mainNames}${annexSummary}${sigSummary ? ' + ' + sigSummary : ''} (${totalMB.toFixed(1)}MB) — indexEndPage=${indexEndPage}${signPages ? `, signPages='${signPages}'` : ''}`,
   );
 
   const args = [join(__dirname, 'server', 'error_detector.py')];
@@ -350,6 +376,7 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   if (clientSig) args.push('--client-sig', clientSig.path);
   if (advocateSig) args.push('--advocate-sig', advocateSig.path);
   args.push('--index-end-page', String(indexEndPage));
+  if (signPages) args.push('--sign-pages', signPages);
   args.push('--mode', 'write');
   args.push('--write-stdout');
 

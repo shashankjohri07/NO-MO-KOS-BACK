@@ -66,6 +66,7 @@ async function processJob(job: Job<WritePaginationJob, JobResult>): Promise<JobR
       clientSigPath,
       advocateSigPath,
       indexEndPage: data.indexEndPage,
+      signPages: data.signPages,
       outputPath,
     });
 

@@ -23,6 +23,12 @@ export interface WritePaginationJob {
   clientSig?: JobFileRef;
   advocateSig?: JobFileRef;
   indexEndPage: number;
+  // Optional comma+range spec ("1, 3-5, 8") of additional MAIN-document
+  // page numbers — by their stamped digit — that should also receive
+  // client/advocate signatures. Annexures are already auto-signed on
+  // every page, so out-of-main-range entries are silently dropped by
+  // the Python CLI. Empty/omitted = behave like before.
+  signPages?: string;
   // Where the worker should write the finished PDF in object storage.
   outputKey: string;
   downloadName: string;
