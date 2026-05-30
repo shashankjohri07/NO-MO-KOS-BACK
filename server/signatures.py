@@ -117,10 +117,11 @@ def stamp_signatures_on_page(
         return
 
     # Sized for legal filings — visible but never dominant. Court convention
-    # is that the sig sits cleanly in the footer; squeezing the box keeps it
-    # out of pre-existing notary seals and page-bottom registry stamps.
-    SIG_MAX_W = 120
-    SIG_MAX_H = 60
+    # is that the sig sits cleanly in the footer; this is the compromise
+    # between "too small to read against notary seals" and "swallowing the
+    # whole bottom of the page".
+    SIG_MAX_W = 150
+    SIG_MAX_H = 80
     LEFT_MARGIN = 60
     RIGHT_MARGIN = 60
     BOTTOM_MARGIN = 30
