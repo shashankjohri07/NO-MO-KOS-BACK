@@ -163,6 +163,12 @@ const uploadDualFields = upload.fields([
   // Single file each — first matching field wins if duplicates posted.
   { name: 'clientSignature', maxCount: 1 },
   { name: 'advocateSignature', maxCount: 1 },
+  // Optional PNG/JPG signatures for the SPECIAL main-document pages listed in
+  // signPages. Separate images from the annexure signatures above — these let
+  // the user sign the vakalatnama / prayer page / affidavit with a distinct
+  // signature set, independent of the every-annexure-page stamps.
+  { name: 'specialSignatureClient', maxCount: 1 },
+  { name: 'specialSignatureAdvocate', maxCount: 1 },
 ]);
 
 // ── Single inline endpoint ────────────────────────────────────────────────
@@ -180,6 +186,8 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   const annexFiles = fileMap.annex ?? [];
   const clientSig = fileMap.clientSignature?.[0];
   const advocateSig = fileMap.advocateSignature?.[0];
+  const specialClientSig = fileMap.specialSignatureClient?.[0];
+  const specialAdvocateSig = fileMap.specialSignatureAdvocate?.[0];
   if (mainFiles.length === 0) {
     res.status(400).json({ ok: false, error: 'No file uploaded' });
     return;
@@ -187,7 +195,12 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
 
   const mainPaths = mainFiles.map((f) => f.path);
   const annexPaths = annexFiles.map((f) => f.path);
-  const sigPaths = [clientSig?.path, advocateSig?.path].filter(Boolean) as string[];
+  const sigPaths = [
+    clientSig?.path,
+    advocateSig?.path,
+    specialClientSig?.path,
+    specialAdvocateSig?.path,
+  ].filter(Boolean) as string[];
   const cleanup = () => {
     for (const p of [...mainPaths, ...annexPaths, ...sigPaths]) fs.unlink(p, () => {});
   };
@@ -210,14 +223,20 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   const sigSummary = [
     clientSig ? 'client-sig' : null,
     advocateSig ? 'advocate-sig' : null,
+    specialClientSig ? 'special-client-sig' : null,
+    specialAdvocateSig ? 'special-advocate-sig' : null,
   ]
     .filter(Boolean)
     .join('+');
   const totalMB =
-    [...mainFiles, ...annexFiles, ...(clientSig ? [clientSig] : []), ...(advocateSig ? [advocateSig] : [])].reduce(
-      (acc, f) => acc + f.size,
-      0,
-    ) / 1024 / 1024;
+    [
+      ...mainFiles,
+      ...annexFiles,
+      ...(clientSig ? [clientSig] : []),
+      ...(advocateSig ? [advocateSig] : []),
+      ...(specialClientSig ? [specialClientSig] : []),
+      ...(specialAdvocateSig ? [specialAdvocateSig] : []),
+    ].reduce((acc, f) => acc + f.size, 0) / 1024 / 1024;
   console.log(
     `[write-pagination] ${mainFiles.length} main(s): ${mainNames}${annexSummary}${sigSummary ? ' + ' + sigSummary : ''} (${totalMB.toFixed(1)}MB) — indexEndPage=${indexEndPage}${signPages ? `, signPages='${signPages}'` : ''}`,
   );
@@ -227,6 +246,8 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   for (const p of annexPaths) args.push('--annex', p);
   if (clientSig) args.push('--client-sig', clientSig.path);
   if (advocateSig) args.push('--advocate-sig', advocateSig.path);
+  if (specialClientSig) args.push('--special-sig-client', specialClientSig.path);
+  if (specialAdvocateSig) args.push('--special-sig-advocate', specialAdvocateSig.path);
   args.push('--index-end-page', String(indexEndPage));
   if (signPages) args.push('--sign-pages', signPages);
   args.push('--mode', 'write');
