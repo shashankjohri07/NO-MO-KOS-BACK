@@ -18,9 +18,11 @@ rotate=page.rotation so the stamped image appears upright at the
 visible footer.
 
 Dense-page handling: court convention requires the signature to appear
-on every page, even when text content reaches close to the bottom. If
-no headroom exists, we force the stamp to the bottom edge and accept a
-minor overlap rather than silently dropping the signature.
+on every page, even when text reaches close to the bottom — but it must
+never cover that text. We shrink the signature to fit the whitespace
+below the text; if there isn't enough, an upright page gets a clean
+white footer band appended at the bottom (the page grows slightly;
+content never shifts), so the signature always lands on blank space.
 """
 
 import sys
@@ -141,11 +143,14 @@ def stamp_signatures_on_page(
     natural ratio so square stamps land at 100×100 and wide cursive sigs
     fill 180×60.
 
-    Overlap protection: scans existing text spans, finds the lowest line,
-    and tries to push the sig row up so it sits cleanly below the
-    content. If the page is too dense for any clean placement, we still
-    stamp at the very bottom (court convention — sig must appear on
-    every page).
+    Overlap protection (signatures must NEVER cover text): scans existing
+    text spans to find the lowest line, then picks the largest of three
+    strategies that keeps the signature off the text —
+      1. full size in the footer when there's room,
+      2. shrink-to-fit the gap below the text (any rotation),
+      3. append a clean white footer band to the page bottom when there's
+         no room (upright pages; content never moves).
+    Rotated pages with no room fall back to a minimum legible size.
 
     Works on rotated pages: positions are computed in the visible
     (rotation-aware) coord system and projected to mediabox before
@@ -162,6 +167,7 @@ def stamp_signatures_on_page(
     # whole bottom of the page".
     SIG_MAX_W = 150
     SIG_MAX_H = 80
+    SIG_MIN_H = 30          # smallest height we still consider legible
     LEFT_MARGIN = 60
     RIGHT_MARGIN = 60
     BOTTOM_MARGIN = 30
@@ -199,17 +205,62 @@ def stamp_signatures_on_page(
         print(f"  text scan failed (rotation={rotation}): {e}", file=sys.stderr)
         max_text_y = 0.0
 
-    # Preferred top of the signature band, then adjust upward if text
-    # would clash. If even the bottom is shared with text, force the
-    # default footer position and accept slight overlap.
-    sig_top = page_h - BOTTOM_MARGIN - SIG_MAX_H
-    if max_text_y + TEXT_BUFFER > sig_top:
-        sig_top = max_text_y + TEXT_BUFFER
-    if sig_top + SIG_MAX_H > page_h - 5:
-        sig_top = page_h - BOTTOM_MARGIN - SIG_MAX_H
+    # ── Smart placement: shrink-to-fit, then extend-page as last resort ──
+    # The whole point is that the signature must NEVER cover document text.
+    #
+    # `avail_h` is the clean whitespace between the lowest text line and the
+    # bottom margin. Three regimes:
+    #   1. Roomy        -> full-size signature at the usual footer slot.
+    #   2. Tight        -> shrink the signature (aspect preserved) to fit the
+    #                      gap. Works on any rotation since it only changes the
+    #                      image rect, not the page.
+    #   3. No room      -> upright pages get a clean white footer band appended
+    #                      below the content (page grows; text never moves).
+    #                      Rotated pages (can't cleanly extend the visible
+    #                      bottom) fall back to the smallest legible size.
+    #
+    # `band_top` / `band_h` define the bounding box both signatures share.
+    avail_h = (page_h - BOTTOM_MARGIN) - (max_text_y + TEXT_BUFFER)
+
+    if avail_h >= SIG_MAX_H:
+        band_h = SIG_MAX_H
+        band_top = page_h - BOTTOM_MARGIN - SIG_MAX_H
+    elif avail_h >= SIG_MIN_H:
+        # Shrink to exactly the gap below the text.
+        band_h = avail_h
+        band_top = max_text_y + TEXT_BUFFER
+    elif rotation == 0:
+        # Append a clean footer band by extending the page's mediabox at the
+        # visible bottom. Content keeps its coordinates, so nothing shifts and
+        # no text is covered. (Verified: for rotation==0, growing mediabox y1
+        # adds space at the visible bottom.)
+        band_h = SIG_MAX_H
+        band_top = max_text_y + TEXT_BUFFER
+        extend_by = (band_top + band_h + BOTTOM_MARGIN) - page_h
+        if extend_by > 0:
+            try:
+                mb = page.mediabox
+                page.set_mediabox(fitz.Rect(mb.x0, mb.y0, mb.x1, mb.y1 + extend_by))
+                page_h = page.rect.height
+                print(
+                    f"  dense page (text reaches y={max_text_y:.0f}); extended "
+                    f"bottom by {extend_by:.0f}pt for a clean signature band",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                # If the page can't be resized, degrade to a minimum-size
+                # signature at the bottom rather than dropping it entirely.
+                print(f"  page extend failed ({e}); using minimum size", file=sys.stderr)
+                band_h = SIG_MIN_H
+                band_top = page_h - BOTTOM_MARGIN - SIG_MIN_H
+    else:
+        # Rotated AND no room: extending the visible bottom isn't reliable for
+        # /Rotate 90/180/270, so use the smallest legible size at the bottom.
+        band_h = SIG_MIN_H
+        band_top = page_h - BOTTOM_MARGIN - SIG_MIN_H
         print(
-            f"  warning: dense page (text reaches y={max_text_y:.0f}); "
-            f"forcing signature to bottom margin",
+            f"  warning: dense rotated page (text reaches y={max_text_y:.0f}); "
+            f"using minimum signature size at bottom",
             file=sys.stderr,
         )
 
@@ -223,7 +274,7 @@ def stamp_signatures_on_page(
             )
         else:
             visible_rect = _fit_visible_rect_to_image(
-                client_sig_path, LEFT_MARGIN, sig_top, SIG_MAX_W, SIG_MAX_H,
+                client_sig_path, LEFT_MARGIN, band_top, SIG_MAX_W, band_h,
             )
             if visible_rect:
                 # Card first (so sig draws ON TOP), then sig.
@@ -254,13 +305,13 @@ def stamp_signatures_on_page(
             )
             return
         aspect = _read_image_aspect(advocate_sig_path) or 1.0
-        h = SIG_MAX_H
+        h = band_h
         w = h * aspect
         if w > SIG_MAX_W:
             w = SIG_MAX_W
             h = w / aspect
         right_x = page_w - RIGHT_MARGIN - w
-        visible_rect = fitz.Rect(right_x, sig_top, right_x + w, sig_top + h)
+        visible_rect = fitz.Rect(right_x, band_top, right_x + w, band_top + h)
         # Card first, then sig on top.
         _draw_white_card(page, visible_rect)
         mediabox_rect = _project_to_mediabox(page, visible_rect)
