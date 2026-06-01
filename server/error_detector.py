@@ -231,7 +231,18 @@ def main():
                              "that should also receive client/advocate signatures, e.g. "
                              "'1, 3-5, 8, 12-15'. Annexure pages are already auto-signed "
                              "on every page, so out-of-main-range entries are silently "
-                             "skipped. Requires --client-sig and/or --advocate-sig.")
+                             "skipped. Requires a signature image (--special-sig-client/"
+                             "--special-sig-advocate, or --client-sig/--advocate-sig).")
+    parser.add_argument("--special-sig-client", default=None,
+                        help="Path to a PNG/JPG signature for the SPECIAL main-document "
+                             "pages listed in --sign-pages (stamped bottom-LEFT). Separate "
+                             "from --client-sig, which signs annexure pages. If omitted, "
+                             "--sign-pages falls back to --client-sig for backward compat.")
+    parser.add_argument("--special-sig-advocate", default=None,
+                        help="Path to a PNG/JPG signature for the SPECIAL main-document "
+                             "pages listed in --sign-pages (stamped bottom-RIGHT). Separate "
+                             "from --advocate-sig, which signs annexure pages. If omitted, "
+                             "--sign-pages falls back to --advocate-sig for backward compat.")
     parser.add_argument("--mode", choices=("detect", "write", "both"), default="detect",
                         help="detect: rule check only. write: stamp page numbers only "
                              "(skips text extraction + rules — much faster). both: do both.")
@@ -256,8 +267,20 @@ def main():
                      "(auto-sign every annex page) or --sign-pages (sign listed main "
                      "pages). Pass one or the other.")
 
-    if args.sign_pages and not (args.client_sig or args.advocate_sig):
-        parser.error("--sign-pages requires --client-sig and/or --advocate-sig.")
+    if (args.special_sig_client or args.special_sig_advocate) and not args.sign_pages:
+        parser.error("--special-sig-client / --special-sig-advocate require --sign-pages "
+                     "(they only apply to the listed main pages).")
+
+    # --sign-pages needs an image to stamp. Prefer the dedicated special-page
+    # signatures; fall back to the annexure signatures for backward compat
+    # with callers that pass a single shared signature set.
+    if args.sign_pages and not (
+        args.special_sig_client or args.special_sig_advocate
+        or args.client_sig or args.advocate_sig
+    ):
+        parser.error("--sign-pages requires a signature image: "
+                     "--special-sig-client/--special-sig-advocate (preferred) "
+                     "or --client-sig/--advocate-sig.")
 
     # Parse --sign-pages spec early so we fail fast on malformed input
     # (before doing any PDF I/O). The set of 1-indexed stamped page
@@ -351,11 +374,15 @@ def main():
     if args.write_stdout:
         out_tmp = tempfile.NamedTemporaryFile(suffix="_numbered.pdf", delete=False)
         out_tmp.close()
+        # Special main pages use their OWN signature images when provided,
+        # falling back to the annexure signatures for backward compat.
+        # Annexure pages were already stamped with --client-sig/--advocate-sig
+        # in append_annexures_to_pdf above, so the two sets stay independent.
         if not write_pagination(
             target_path, out_tmp.name, args.index_end_page,
             extra_sig_pages=extra_sig_physical,
-            client_sig_path=args.client_sig,
-            advocate_sig_path=args.advocate_sig,
+            client_sig_path=args.special_sig_client or args.client_sig,
+            advocate_sig_path=args.special_sig_advocate or args.advocate_sig,
         ):
             print("write_pagination failed", file=sys.stderr)
             sys.exit(1)
