@@ -23,6 +23,13 @@ never cover that text. We shrink the signature to fit the whitespace
 below the text; if there isn't enough, an upright page gets a clean
 white footer band appended at the bottom (the page grows slightly;
 content never shifts), so the signature always lands on blank space.
+
+Transparency: the signature's white/near-white background is dropped to
+transparent (chroma-key) before stamping, and no opaque backing card is
+drawn. So in the rare case the signature does sit over content, the text
+shows THROUGH the gaps in the ink instead of being hidden. Best for dark
+ink scanned on white paper; full-colour photos/logos have no white
+background to drop and should be supplied as ready-made transparent PNGs.
 """
 
 import sys
@@ -48,6 +55,66 @@ def _read_image_aspect(path: str) -> Optional[float]:
     if iw <= 0 or ih <= 0:
         return None
     return iw / ih
+
+
+# Cache: source signature path -> transparent-background PNG path. The same
+# signature is stamped on many pages, so the chroma-key runs ONCE per image.
+_TRANSPARENT_CACHE: dict = {}
+
+
+def _transparent_signature(path: str) -> str:
+    """Return a path to a copy of the signature whose white / near-white
+    background has been made transparent, so document text shows THROUGH the
+    gaps in the ink instead of being hidden by an opaque white box. Cached per
+    source path; falls back to the original path if PIL is missing or anything
+    fails.
+
+    Tuned for the common case (dark ink scanned on white paper). Full-colour
+    images (photos, colour logos) have no white background to drop, so they
+    come back essentially unchanged — those need a real transparent PNG.
+    """
+    if path in _TRANSPARENT_CACHE:
+        return _TRANSPARENT_CACHE[path]
+
+    result = path
+    WHITE = 238  # R,G,B all at/above this -> treated as background -> transparent
+    try:
+        from PIL import Image as PILImage
+        import tempfile
+
+        img = PILImage.open(path).convert("RGBA")
+        try:
+            # Fast vectorised path when numpy is available.
+            import numpy as _np
+            arr = _np.array(img)
+            mask = (
+                (arr[:, :, 0] >= WHITE)
+                & (arr[:, :, 1] >= WHITE)
+                & (arr[:, :, 2] >= WHITE)
+            )
+            arr[:, :, 3][mask] = 0
+            img = PILImage.fromarray(arr, "RGBA")
+        except ImportError:
+            # Pure-PIL fallback (slower, but cached so it runs once).
+            px = img.load()
+            w, h = img.size
+            for yy in range(h):
+                for xx in range(w):
+                    r, g, b, a = px[xx, yy]
+                    if r >= WHITE and g >= WHITE and b >= WHITE:
+                        px[xx, yy] = (r, g, b, 0)
+
+        tmp = tempfile.NamedTemporaryFile(suffix="_sig_transparent.png", delete=False)
+        tmp.close()
+        img.save(tmp.name, "PNG")
+        result = tmp.name
+    except ImportError:
+        pass  # PIL unavailable — stamp the original image unchanged
+    except Exception as e:
+        print(f"  signature transparency failed for {path}: {e}", file=sys.stderr)
+
+    _TRANSPARENT_CACHE[path] = result
+    return result
 
 
 def _fit_visible_rect_to_image(
@@ -89,46 +156,6 @@ def _project_to_mediabox(page, visible_rect: "fitz.Rect") -> "fitz.Rect":
         min(r.x0, r.x1), min(r.y0, r.y1),
         max(r.x0, r.x1), max(r.y0, r.y1),
     )
-
-
-def _draw_white_card(page, visible_rect: "fitz.Rect", padding: float = 4.0) -> None:
-    """Stamp a small opaque white rectangle with a thin gray border at
-    `visible_rect` (plus `padding` on every side). Drawn BEFORE the
-    signature image so the user's sig — even when scanned with a
-    transparent background — pops cleanly off any underlying text,
-    notary seal, or registry stamp instead of being washed out.
-
-    Court convention treats the signature as the canonical mark; the
-    card around it is consistent with how attorneys stick signature
-    labels onto filed copies.
-    """
-    if not fitz:
-        return
-    card_visible = fitz.Rect(
-        visible_rect.x0 - padding,
-        visible_rect.y0 - padding,
-        visible_rect.x1 + padding,
-        visible_rect.y1 + padding,
-    )
-    # Clamp to page bounds so the rect never escapes the visible area.
-    page_rect = page.rect
-    card_visible = fitz.Rect(
-        max(0, card_visible.x0),
-        max(0, card_visible.y0),
-        min(page_rect.width, card_visible.x1),
-        min(page_rect.height, card_visible.y1),
-    )
-    card_mediabox = _project_to_mediabox(page, card_visible)
-    try:
-        page.draw_rect(
-            card_mediabox,
-            color=(0.7, 0.7, 0.7),   # thin gray border for definition
-            fill=(1, 1, 1),           # opaque white background
-            width=0.5,
-            fill_opacity=1.0,
-        )
-    except Exception as e:
-        print(f"  white card draw failed: {e}", file=sys.stderr)
 
 
 def stamp_signatures_on_page(
@@ -273,17 +300,18 @@ def stamp_signatures_on_page(
                 file=sys.stderr,
             )
         else:
+            # Drop the white background to transparent so any content behind
+            # shows through the gaps in the ink (no opaque backing card).
+            render_path = _transparent_signature(client_sig_path)
             visible_rect = _fit_visible_rect_to_image(
-                client_sig_path, LEFT_MARGIN, band_top, SIG_MAX_W, band_h,
+                render_path, LEFT_MARGIN, band_top, SIG_MAX_W, band_h,
             )
             if visible_rect:
-                # Card first (so sig draws ON TOP), then sig.
-                _draw_white_card(page, visible_rect)
                 mediabox_rect = _project_to_mediabox(page, visible_rect)
                 try:
                     page.insert_image(
                         mediabox_rect,
-                        filename=client_sig_path,
+                        filename=render_path,
                         keep_proportion=True,
                         rotate=rotation,
                     )
@@ -304,7 +332,8 @@ def stamp_signatures_on_page(
                 file=sys.stderr,
             )
             return
-        aspect = _read_image_aspect(advocate_sig_path) or 1.0
+        render_path = _transparent_signature(advocate_sig_path)
+        aspect = _read_image_aspect(render_path) or 1.0
         h = band_h
         w = h * aspect
         if w > SIG_MAX_W:
@@ -312,13 +341,11 @@ def stamp_signatures_on_page(
             h = w / aspect
         right_x = page_w - RIGHT_MARGIN - w
         visible_rect = fitz.Rect(right_x, band_top, right_x + w, band_top + h)
-        # Card first, then sig on top.
-        _draw_white_card(page, visible_rect)
         mediabox_rect = _project_to_mediabox(page, visible_rect)
         try:
             page.insert_image(
                 mediabox_rect,
-                filename=advocate_sig_path,
+                filename=render_path,
                 keep_proportion=True,
                 rotate=rotation,
             )
