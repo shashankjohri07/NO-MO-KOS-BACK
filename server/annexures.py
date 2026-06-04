@@ -29,23 +29,33 @@ from signatures import stamp_signatures_on_page
 
 def stamp_annexure_label(page, label: str) -> None:
     """Stamp `label` (e.g. "Annexure A-1") horizontally centered at the very
-    top of the page (in the page's VISIBLE orientation), sharing the top
-    header band with the page-number digit. Bold, large, black.
+    TOP of the page (visible orientation). Bold, large, black.
 
-    Works correctly on pages with non-zero /Rotate flag: visible coords
-    are projected to mediabox coords via page.derotation_matrix, and
-    rotate=page.rotation aligns the glyph orientation with the rendered
-    view.
+    Clean placement (the label must NEVER be lost in the annexure's own
+    content — scans and Gmail printouts often start at the very top edge):
+    the label hugs the very top of the paper and is drawn on an opaque white
+    card so it pops cleanly off any content directly behind it. The card is
+    drawn first, the bold label on top.
 
-    Geometry: page-number digit lives in y∈[28, 44] (top-right). Annexure
-    baseline at y=40 → visible glyph spans roughly y=17..47. Horizontally
-    separated: digit at x≈552, label centered around x≈300.
+    A page-resize approach (appending a white band) was rejected: extending
+    the visible top does not survive PyMuPDF's insert_pdf (the page origin is
+    re-normalised on copy), so the band would silently move to the bottom.
+    The white card is resize-free and therefore copy-safe.
+
+    Works on rotated pages: visible coords are projected to mediabox coords via
+    page.derotation_matrix, with rotate=page.rotation for glyph orientation.
     """
     if not fitz:
         return
     FONTSIZE = 22
-    FONTNAME = "hebo"  # Helvetica-Bold (PyMuPDF built-in)
-    Y_BASELINE = 40
+    FONTNAME = "hebo"   # Helvetica-Bold (PyMuPDF built-in)
+    Y_BASELINE = 30     # hug the very top of the paper
+    CARD_PAD = 6.0
+
+    def _to_mediabox(rect_visible):
+        r = rect_visible * page.derotation_matrix
+        return fitz.Rect(min(r.x0, r.x1), min(r.y0, r.y1),
+                         max(r.x0, r.x1), max(r.y0, r.y1))
 
     try:
         text_w = fitz.get_text_length(label, fontsize=FONTSIZE, fontname=FONTNAME)
@@ -53,11 +63,23 @@ def stamp_annexure_label(page, label: str) -> None:
         visible_w = page.rect.width
         x_visible = (visible_w - text_w) / 2
 
-        # Project visible-coord point to mediabox coord that insert_text needs.
-        # For rotation==0 this is a no-op (derotation_matrix is identity).
-        point_visible = fitz.Point(x_visible, Y_BASELINE)
-        point_mediabox = point_visible * page.derotation_matrix
+        # Opaque white card behind the label so it reads cleanly even when the
+        # annexure content runs to the very top edge. Drawn BEFORE the text.
+        card_visible = fitz.Rect(
+            x_visible - CARD_PAD,
+            Y_BASELINE - FONTSIZE - CARD_PAD + 4,
+            x_visible + text_w + CARD_PAD,
+            Y_BASELINE + CARD_PAD,
+        )
+        try:
+            page.draw_rect(_to_mediabox(card_visible), color=None,
+                           fill=(1, 1, 1), fill_opacity=1.0)
+        except Exception as e:
+            print(f"  annexure label card draw failed: {e}", file=sys.stderr)
 
+        # Project visible-coord baseline to mediabox coord that insert_text
+        # needs. For rotation==0 this is a no-op (derotation_matrix is identity).
+        point_mediabox = fitz.Point(x_visible, Y_BASELINE) * page.derotation_matrix
         page.insert_text(
             point_mediabox,
             label,
