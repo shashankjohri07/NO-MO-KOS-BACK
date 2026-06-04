@@ -20,9 +20,11 @@ visible footer.
 Dense-page handling: court convention requires the signature to appear
 on every page, even when text reaches close to the bottom — but it must
 never cover that text. We shrink the signature to fit the whitespace
-below the text; if there isn't enough, an upright page gets a clean
-white footer band appended at the bottom (the page grows slightly;
-content never shifts), so the signature always lands on blank space.
+below the text; if there isn't enough, the page content is scaled up
+into the area above a reserved footer strip (page size unchanged) and
+the signature lands in that clean strip — robust for any signature
+(including opaque photos) and survives insert_pdf, since the page is
+rebuilt rather than mediabox-hacked.
 
 Transparency: the signature's white/near-white background is dropped to
 transparent (chroma-key) before stamping, and no opaque backing card is
@@ -158,6 +160,36 @@ def _project_to_mediabox(page, visible_rect: "fitz.Rect") -> "fitz.Rect":
     )
 
 
+def _reserve_footer_strip(page, strip_h: float):
+    """Rebuild `page` in its document so the existing content is scaled to fit
+    the area ABOVE a `strip_h`-tall clean footer strip. Page SIZE is unchanged;
+    the bottom strip is left blank for the signature(s). Returns the fresh page.
+
+    The content is re-imported with show_pdf_page as a vector XObject, so
+    quality is preserved and it survives a later insert_pdf (unlike a mediabox
+    resize, which the page origin re-normalisation breaks on copy). The rebuilt
+    page is upright — show_pdf_page bakes in any /Rotate of the source, so
+    rotated pages need no special handling downstream.
+    """
+    doc = page.parent
+    idx = page.number
+    w = page.rect.width
+    h = page.rect.height
+
+    src = fitz.open()
+    src.insert_pdf(doc, from_page=idx, to_page=idx)
+    try:
+        doc.delete_page(idx)
+        new = doc.new_page(pno=idx, width=w, height=h)
+        # Fit the original content into the top region, aspect preserved so the
+        # text is never distorted (a thin side margin is acceptable).
+        target = fitz.Rect(0, 0, w, h - strip_h)
+        new.show_pdf_page(target, src, 0, keep_proportion=True)
+    finally:
+        src.close()
+    return new
+
+
 def stamp_signatures_on_page(
     page,
     client_sig_path: Optional[str],
@@ -175,9 +207,9 @@ def stamp_signatures_on_page(
     strategies that keeps the signature off the text —
       1. full size in the footer when there's room,
       2. shrink-to-fit the gap below the text (any rotation),
-      3. append a clean white footer band to the page bottom when there's
-         no room (upright pages; content never moves).
-    Rotated pages with no room fall back to a minimum legible size.
+      3. reserve a clean footer strip by scaling the page content into the
+         area above it when there's no room (page size unchanged; works for
+         any signature, incl. opaque photos, and survives insert_pdf).
 
     Works on rotated pages: positions are computed in the visible
     (rotation-aware) coord system and projected to mediabox before
@@ -232,19 +264,19 @@ def stamp_signatures_on_page(
         print(f"  text scan failed (rotation={rotation}): {e}", file=sys.stderr)
         max_text_y = 0.0
 
-    # ── Smart placement: shrink-to-fit, then extend-page as last resort ──
-    # The whole point is that the signature must NEVER cover document text.
-    #
+    # ── Smart placement: the signature must NEVER cover content ──
     # `avail_h` is the clean whitespace between the lowest text line and the
     # bottom margin. Three regimes:
-    #   1. Roomy        -> full-size signature at the usual footer slot.
-    #   2. Tight        -> shrink the signature (aspect preserved) to fit the
-    #                      gap. Works on any rotation since it only changes the
-    #                      image rect, not the page.
-    #   3. No room      -> upright pages get a clean white footer band appended
-    #                      below the content (page grows; text never moves).
-    #                      Rotated pages (can't cleanly extend the visible
-    #                      bottom) fall back to the smallest legible size.
+    #   1. Roomy   -> full-size signature in the footer (page untouched).
+    #   2. Tight   -> shrink the signature to fit the gap below the text
+    #                 (page untouched; works on any rotation).
+    #   3. No room -> reserve a clean footer STRIP by scaling the page content
+    #                 into the area above it, then sign in the strip. Page size
+    #                 is unchanged; it works for ANY signature (incl. opaque
+    #                 photos/logos) because the signature lands on blank space,
+    #                 and it survives a later insert_pdf because the page is
+    #                 rebuilt (no fragile mediabox hack). Also normalises any
+    #                 /Rotate, so rotated pages are handled the same way.
     #
     # `band_top` / `band_h` define the bounding box both signatures share.
     avail_h = (page_h - BOTTOM_MARGIN) - (max_text_y + TEXT_BUFFER)
@@ -253,43 +285,33 @@ def stamp_signatures_on_page(
         band_h = SIG_MAX_H
         band_top = page_h - BOTTOM_MARGIN - SIG_MAX_H
     elif avail_h >= SIG_MIN_H:
-        # Shrink to exactly the gap below the text.
+        # Shrink to exactly the clean gap below the text.
         band_h = avail_h
         band_top = max_text_y + TEXT_BUFFER
-    elif rotation == 0:
-        # Append a clean footer band by extending the page's mediabox at the
-        # visible bottom. Content keeps its coordinates, so nothing shifts and
-        # no text is covered. (Verified: for rotation==0, growing mediabox y1
-        # adds space at the visible bottom.)
-        band_h = SIG_MAX_H
-        band_top = max_text_y + TEXT_BUFFER
-        extend_by = (band_top + band_h + BOTTOM_MARGIN) - page_h
-        if extend_by > 0:
-            try:
-                mb = page.mediabox
-                page.set_mediabox(fitz.Rect(mb.x0, mb.y0, mb.x1, mb.y1 + extend_by))
-                page_h = page.rect.height
-                print(
-                    f"  dense page (text reaches y={max_text_y:.0f}); extended "
-                    f"bottom by {extend_by:.0f}pt for a clean signature band",
-                    file=sys.stderr,
-                )
-            except Exception as e:
-                # If the page can't be resized, degrade to a minimum-size
-                # signature at the bottom rather than dropping it entirely.
-                print(f"  page extend failed ({e}); using minimum size", file=sys.stderr)
-                band_h = SIG_MIN_H
-                band_top = page_h - BOTTOM_MARGIN - SIG_MIN_H
     else:
-        # Rotated AND no room: extending the visible bottom isn't reliable for
-        # /Rotate 90/180/270, so use the smallest legible size at the bottom.
-        band_h = SIG_MIN_H
-        band_top = page_h - BOTTOM_MARGIN - SIG_MIN_H
-        print(
-            f"  warning: dense rotated page (text reaches y={max_text_y:.0f}); "
-            f"using minimum signature size at bottom",
-            file=sys.stderr,
-        )
+        # No clean room: reserve a footer strip by scaling the content up.
+        STRIP_H = 92.0
+        try:
+            page = _reserve_footer_strip(page, STRIP_H)
+            page_w = page.rect.width
+            page_h = page.rect.height
+            rotation = page.rotation  # rebuilt page is upright
+            print(
+                f"  dense page (text reaches y={max_text_y:.0f}); scaled content "
+                f"and reserved a {STRIP_H:.0f}pt footer strip for the signature",
+                file=sys.stderr,
+            )
+            band_h = 60.0
+            band_top = page_h - 14.0 - band_h  # sits inside the clean strip
+        except Exception as e:
+            # Rebuild failed — degrade to the smallest legible size at the
+            # bottom rather than dropping the signature.
+            print(
+                f"  footer-strip reserve failed ({e}); using minimum size",
+                file=sys.stderr,
+            )
+            band_h = SIG_MIN_H
+            band_top = page_h - BOTTOM_MARGIN - SIG_MIN_H
 
     # Client (left)
     if client_sig_path:
