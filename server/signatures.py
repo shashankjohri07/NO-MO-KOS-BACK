@@ -19,13 +19,13 @@ visible footer.
 
 Dense-page handling: court convention requires the signature to appear
 on every page, even when text reaches close to the bottom — but it must
-never cover that content. We check the footer zone's ACTUAL rendered
-pixels (so text, images, scans and vector graphics are all detected);
-if it isn't blank, the page content is scaled up into the area above a
-reserved footer strip (page size unchanged) and the signature lands in
-that clean strip — robust for any signature (including opaque photos),
-survives insert_pdf (the page is rebuilt, not mediabox-hacked), and
-normalises /Rotate.
+never cover that content. Placement is decided from the page's ACTUAL
+rendered pixels (so text, images, scans and vector graphics are all
+detected): a normal page signs at the bottom footer; a dense page with
+a clear top margin signs in the top header area; and if both ends are
+busy (e.g. full-page scans) the content is scaled up into the area
+above a reserved bottom strip (page size unchanged; survives insert_pdf;
+normalises /Rotate).
 
 Transparency: the signature's white/near-white background is dropped to
 transparent (chroma-key) before stamping, and no opaque backing card is
@@ -161,29 +161,29 @@ def _project_to_mediabox(page, visible_rect: "fitz.Rect") -> "fitz.Rect":
     )
 
 
-def _footer_is_blank(page, strip_h: float) -> bool:
-    """True if the bottom `strip_h` (visible) band of the page renders blank
-    (near-white). Decides from the ACTUAL rendered pixels, so it cannot be
-    fooled by content type — body text, embedded images, full-page scans and
-    vector drawings are all detected (a text-only scan silently missed
-    image/scanned annexures, which is how signatures ended up over content).
+def _zone_is_blank(page, y0: float, y1: float) -> bool:
+    """True if the horizontal band between visible-y `y0` and `y1` renders
+    blank (near-white). Decides from the ACTUAL rendered pixels, so it cannot
+    be fooled by content type — body text, embedded images, full-page scans
+    and vector drawings are all detected (a text-only scan silently missed
+    image/scanned annexures).
 
     Rotation-agnostic: get_pixmap renders the visible (rotation-applied) view,
-    so the pixmap's bottom rows ARE the visible footer regardless of /Rotate.
-    On any error we return False (assume content) so the caller reserves a
-    clean strip rather than risk stamping over something.
+    so a y-band maps to the same band of pixmap rows regardless of /Rotate.
+    On any error we return False (assume content) so the caller plays safe.
     """
     try:
         zoom = 0.4  # low-res is plenty for a blank / not-blank decision
         pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        band_rows = int(strip_h * zoom)
-        if band_rows < 1 or pm.height < 1 or pm.width < 1:
+        r0 = max(0, int(y0 * zoom))
+        r1 = min(pm.height, int(y1 * zoom))
+        if r1 <= r0 or pm.width < 1:
             return True
         data = pm.samples
         stride = pm.stride
         n = pm.n
         WHITE = 244
-        for y in range(max(0, pm.height - band_rows), pm.height):
+        for y in range(r0, r1):
             base = y * stride
             for x in range(0, pm.width, 2):  # subsample columns for speed
                 off = base + x * n
@@ -191,7 +191,7 @@ def _footer_is_blank(page, strip_h: float) -> bool:
                     return False
         return True
     except Exception as e:
-        print(f"  footer blank-check failed ({e}); assuming content", file=sys.stderr)
+        print(f"  zone blank-check failed ({e}); assuming content", file=sys.stderr)
         return False
 
 
@@ -237,14 +237,14 @@ def stamp_signatures_on_page(
     natural ratio so square stamps land at 100×100 and wide cursive sigs
     fill 180×60.
 
-    Overlap protection (signatures must NEVER cover content): looks at the
-    ACTUAL rendered pixels of the footer zone — content-agnostic, so body
-    text, embedded images, full-page scans and vector graphics are all caught
-    (a text-only scan used to miss image/scanned annexures). If the footer is
-    already blank the signature is stamped there; otherwise a clean footer
-    strip is reserved by scaling the page content up into the area above it
-    (page size unchanged, works for any signature incl. opaque photos,
-    survives insert_pdf, and normalises /Rotate).
+    Overlap protection (signatures must NEVER cover content): placement is
+    decided from the ACTUAL rendered pixels, so it is content-agnostic — body
+    text, embedded images, full-page scans and vector graphics are all caught.
+      * Normal page (footer blank)            -> sign at the BOTTOM footer.
+      * Dense page with a clear top margin     -> sign in the TOP header area.
+      * Both ends busy (e.g. full-page scans)  -> reserve a clean bottom strip
+        by scaling the content up (page size unchanged; survives insert_pdf;
+        normalises /Rotate).
 
     Works on rotated pages: positions are computed in the visible
     (rotation-aware) coord system and projected to mediabox before
@@ -262,43 +262,45 @@ def stamp_signatures_on_page(
     SIG_MAX_W = 150
     LEFT_MARGIN = 60
     RIGHT_MARGIN = 60
-    STRIP_H = 92.0    # clean footer strip the signature lives in
-    band_h = 60.0     # signature bounding-box height (consistent on every page)
+    STRIP_H = 92.0      # footer / scan band height to test for content
+    band_h = 60.0       # signature bounding-box height
+    TOP_HEADER = 48.0   # below the page-number / annexure-label band
 
     # Use rotation-aware (visible) page dims everywhere.
     page_w = page.rect.width
     page_h = page.rect.height
     rotation = page.rotation
 
-    # ── Placement: the signature must NEVER cover content ──
-    # Decide from the ACTUAL rendered pixels of the footer zone, so it is fully
-    # content-agnostic — body text, embedded images, full-page scans and vector
-    # graphics are all caught (a text-only scan silently missed image/scanned
-    # annexures, which is how signatures ended up over content):
-    #   * footer already blank -> stamp the signature there, page untouched.
-    #   * footer has content   -> reserve a clean strip by scaling the page
-    #     content up into the area above it. Page size stays the same, works
-    #     for ANY signature (incl. opaque photos), survives insert_pdf (the
-    #     page is rebuilt, not mediabox-hacked) and normalises /Rotate.
-    if not _footer_is_blank(page, STRIP_H):
+    # ── Placement (decided from ACTUAL rendered pixels, so any content type —
+    # text, images, scans, vector graphics — is caught) ──
+    #   * Normal page (footer blank)        -> sign at the BOTTOM footer.
+    #   * Dense page, top header is clear    -> sign at the TOP (header area).
+    #   * Both ends occupied (rare)          -> reserve a clean bottom strip by
+    #                                           scaling the content up.
+    TOP_BAND_H = 42.0   # signature is a bit smaller at the top (tighter margin)
+    if _zone_is_blank(page, page_h - STRIP_H, page_h):
+        # Normal page — bottom footer, as before.
+        band_top = page_h - 14.0 - band_h
+    elif _zone_is_blank(page, TOP_HEADER, TOP_HEADER + TOP_BAND_H + 6):
+        # Dense page — put the signature in the clear top header area.
+        band_h = TOP_BAND_H
+        band_top = TOP_HEADER
+        print("  dense page; signing in the top header area", file=sys.stderr)
+    else:
+        # Both ends busy — scale the content up and reserve a clean strip.
         try:
             page = _reserve_footer_strip(page, STRIP_H)
             page_w = page.rect.width
             page_h = page.rect.height
             rotation = page.rotation  # rebuilt page is upright
             print(
-                f"  footer had content; scaled page and reserved a "
-                f"{STRIP_H:.0f}pt strip for the signature",
+                f"  dense page (top also full); scaled content and reserved a "
+                f"{STRIP_H:.0f}pt bottom strip",
                 file=sys.stderr,
             )
         except Exception as e:
-            print(
-                f"  footer-strip reserve failed ({e}); stamping at the bottom",
-                file=sys.stderr,
-            )
-
-    # Signature band sits inside the (now guaranteed-clean) footer strip.
-    band_top = page_h - 14.0 - band_h
+            print(f"  strip reserve failed ({e}); stamping at the bottom", file=sys.stderr)
+        band_top = page_h - 14.0 - band_h
 
     # Client (left)
     if client_sig_path:
