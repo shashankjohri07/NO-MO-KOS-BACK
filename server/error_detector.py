@@ -33,6 +33,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import sys
 import tempfile
 
@@ -386,8 +387,10 @@ def main():
         ):
             print("write_pagination failed", file=sys.stderr)
             sys.exit(1)
+        # Stream in chunks instead of f.read(): a 300MB filing no longer
+        # doubles its footprint in this process's RAM on the way out.
         with open(out_tmp.name, "rb") as f:
-            sys.stdout.buffer.write(f.read())
+            shutil.copyfileobj(f, sys.stdout.buffer, 1024 * 1024)
         try:
             os.unlink(out_tmp.name)
         except OSError:

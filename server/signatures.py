@@ -35,29 +35,39 @@ ink scanned on white paper; full-colour photos/logos have no white
 background to drop and should be supplied as ready-made transparent PNGs.
 """
 
+import os
 import sys
 from typing import Optional
 
 from config import fitz
 
 
+# Cache: image path -> aspect ratio (or None). The same one or two signature
+# files are measured on EVERY page of a filing, so without this a 100-page
+# document costs ~200 disk opens instead of 2.
+_ASPECT_CACHE: dict = {}
+
+
 def _read_image_aspect(path: str) -> Optional[float]:
     """Pixel width/height of the image at `path`, or None if unreadable.
-    PIL is imported lazily so write-only paths that never touch images
-    don't pay its import cost on cold start."""
+    Cached per path (signature files are immutable for the run). PIL is
+    imported lazily so write-only paths that never touch images don't pay
+    its import cost on cold start."""
+    if path in _ASPECT_CACHE:
+        return _ASPECT_CACHE[path]
+    aspect = None
     try:
         from PIL import Image as PILImage
-    except ImportError:
-        return None
-    try:
         with PILImage.open(path) as img:
             iw, ih = img.size
+        if iw > 0 and ih > 0:
+            aspect = iw / ih
+    except ImportError:
+        pass
     except Exception as e:
         print(f"  could not read image {path}: {e}", file=sys.stderr)
-        return None
-    if iw <= 0 or ih <= 0:
-        return None
-    return iw / ih
+    _ASPECT_CACHE[path] = aspect
+    return aspect
 
 
 # Cache: source signature path -> transparent-background PNG path. The same
@@ -86,26 +96,17 @@ def _transparent_signature(path: str) -> str:
         import tempfile
 
         img = PILImage.open(path).convert("RGBA")
-        try:
-            # Fast vectorised path when numpy is available.
-            import numpy as _np
-            arr = _np.array(img)
-            mask = (
-                (arr[:, :, 0] >= WHITE)
-                & (arr[:, :, 1] >= WHITE)
-                & (arr[:, :, 2] >= WHITE)
-            )
-            arr[:, :, 3][mask] = 0
-            img = PILImage.fromarray(arr, "RGBA")
-        except ImportError:
-            # Pure-PIL fallback (slower, but cached so it runs once).
-            px = img.load()
-            w, h = img.size
-            for yy in range(h):
-                for xx in range(w):
-                    r, g, b, a = px[xx, yy]
-                    if r >= WHITE and g >= WHITE and b >= WHITE:
-                        px[xx, yy] = (r, g, b, 0)
+        # Vectorised entirely in PIL's C layer (no numpy dependency, no
+        # Python pixel loop): build a "background" mask of pixels whose R,
+        # G and B are ALL >= WHITE, then zero the alpha channel there.
+        from PIL import ImageChops
+        r, g, b, a = img.split()
+        thr = [0] * WHITE + [255] * (256 - WHITE)
+        bg = ImageChops.multiply(
+            ImageChops.multiply(r.point(thr), g.point(thr)), b.point(thr)
+        )
+        a = ImageChops.subtract(a, bg)  # alpha -> 0 where background
+        img.putalpha(a)
 
         tmp = tempfile.NamedTemporaryFile(suffix="_sig_transparent.png", delete=False)
         tmp.close()
@@ -174,22 +175,19 @@ def _zone_is_blank(page, y0: float, y1: float) -> bool:
     """
     try:
         zoom = 0.4  # low-res is plenty for a blank / not-blank decision
-        pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        r0 = max(0, int(y0 * zoom))
-        r1 = min(pm.height, int(y1 * zoom))
-        if r1 <= r0 or pm.width < 1:
+        clip = fitz.Rect(0, max(0.0, y0), page.rect.width,
+                         min(page.rect.height, y1))
+        if clip.is_empty:
             return True
-        data = pm.samples
-        stride = pm.stride
-        n = pm.n
+        # Render ONLY the zone (not the whole page) in grayscale: ~10x less
+        # rasterisation work per call, and the blank check becomes a single
+        # C-level pass over the bytes instead of a Python pixel loop.
+        pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip,
+                             colorspace=fitz.csGRAY, alpha=False)
+        if pm.width < 1 or pm.height < 1:
+            return True
         WHITE = 244
-        for y in range(r0, r1):
-            base = y * stride
-            for x in range(0, pm.width, 2):  # subsample columns for speed
-                off = base + x * n
-                if data[off] < WHITE or data[off + 1] < WHITE or data[off + 2] < WHITE:
-                    return False
-        return True
+        return min(pm.samples) >= WHITE
     except Exception as e:
         print(f"  zone blank-check failed ({e}); assuming content", file=sys.stderr)
         return False
@@ -304,8 +302,7 @@ def stamp_signatures_on_page(
 
     # Client (left)
     if client_sig_path:
-        import os as _os
-        if not _os.path.exists(client_sig_path):
+        if not os.path.exists(client_sig_path):
             print(
                 f"  client sig file missing on disk: {client_sig_path}",
                 file=sys.stderr,
@@ -336,8 +333,7 @@ def stamp_signatures_on_page(
     # Advocate (right). Right-edge anchored — compute width first in
     # visible coords, then project to mediabox.
     if advocate_sig_path:
-        import os as _os
-        if not _os.path.exists(advocate_sig_path):
+        if not os.path.exists(advocate_sig_path):
             print(
                 f"  advocate sig file missing on disk: {advocate_sig_path}",
                 file=sys.stderr,
