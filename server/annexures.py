@@ -96,35 +96,24 @@ def stamp_annexure_label(page, label: str) -> None:
         )
 
 
-def append_annexures_to_pdf(
-    base_path: str,
+def append_annexures_to_doc(
+    doc,
     annexure_paths: List[str],
-    output_path: str,
     client_sig_path: Optional[str] = None,
     advocate_sig_path: Optional[str] = None,
 ) -> bool:
-    """Append each annexure file to base_path with a centered "Annexure A-N"
-    label stamped on the annexure's first page. N is sequential starting at 1.
+    """Append each annexure file to the OPEN document `doc`, stamping the
+    "Annexure A-N" label on each annexure's first page and (optionally) the
+    client/advocate signatures on every annexure page.
 
-    If client_sig_path and/or advocate_sig_path are provided, signatures are
-    stamped in the footer of EVERY page of every annexure.
-
-    Returns True on success.
+    Core of append_annexures_to_pdf, split out so the streaming hot path can
+    keep one document in memory across stages and save ONCE at the end —
+    profiling showed the intermediate save+reopen round trip was the single
+    largest cost of a write run. Does not save or close `doc`.
     """
     if not fitz:
         return False
-    if not annexure_paths:
-        try:
-            with fitz.open(base_path) as doc:
-                doc.save(output_path)
-            return True
-        except Exception as e:
-            print(f"append_annexures: copy failed: {e}", file=sys.stderr)
-            return False
-
-    out = None
     try:
-        out = fitz.open(base_path)
         for idx, path in enumerate(annexure_paths, start=1):
             label = f"Annexure A-{idx}"
             try:
@@ -160,7 +149,7 @@ def append_annexures_to_pdf(
                         file=sys.stderr,
                     )
 
-                out.insert_pdf(annex)
+                doc.insert_pdf(annex)
             finally:
                 annex.close()
 
@@ -168,7 +157,48 @@ def append_annexures_to_pdf(
                 f"  appended annexure {idx}: {os.path.basename(path)} (label '{label}')",
                 file=sys.stderr,
             )
+        return True
+    except Exception as e:
+        print(f"append_annexures error: {e}", file=sys.stderr)
+        return False
 
+
+def append_annexures_to_pdf(
+    base_path: str,
+    annexure_paths: List[str],
+    output_path: str,
+    client_sig_path: Optional[str] = None,
+    advocate_sig_path: Optional[str] = None,
+) -> bool:
+    """Append each annexure file to base_path with a centered "Annexure A-N"
+    label stamped on the annexure's first page. N is sequential starting at 1.
+
+    If client_sig_path and/or advocate_sig_path are provided, signatures are
+    stamped in the footer of EVERY page of every annexure.
+
+    File-based wrapper around append_annexures_to_doc (kept for the JSON /
+    non-streaming paths and existing callers). Returns True on success.
+    """
+    if not fitz:
+        return False
+    if not annexure_paths:
+        try:
+            with fitz.open(base_path) as doc:
+                doc.save(output_path)
+            return True
+        except Exception as e:
+            print(f"append_annexures: copy failed: {e}", file=sys.stderr)
+            return False
+
+    out = None
+    try:
+        out = fitz.open(base_path)
+        if not append_annexures_to_doc(
+            out, annexure_paths,
+            client_sig_path=client_sig_path,
+            advocate_sig_path=advocate_sig_path,
+        ):
+            return False
         out.save(output_path, garbage=3, deflate=True)
         return True
     except Exception as e:

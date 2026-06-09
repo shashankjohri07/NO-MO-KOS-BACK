@@ -46,12 +46,47 @@ if _HERE not in sys.path:
 
 from config import fitz  # noqa: E402
 from extraction import extract_pages  # noqa: E402
-from pagination import write_pagination, check_rule_pagination  # noqa: E402
+from pagination import write_pagination, paginate_doc, check_rule_pagination  # noqa: E402
 from rules import check_rule_doc_upload  # noqa: E402
 from annotated_pdf import generate_annotated_pdf  # noqa: E402
-from annexures import append_annexures_to_pdf  # noqa: E402
-from merge import merge_pdfs  # noqa: E402
+from annexures import append_annexures_to_pdf, append_annexures_to_doc  # noqa: E402
+from merge import merge_pdfs, merge_to_doc  # noqa: E402
 from page_spec import parse_page_spec, format_page_set, PageSpecError  # noqa: E402
+
+
+def _translate_sign_pages(sign_page_spec: set, main_total: int, index_end_page: int) -> set:
+    """Translate user-facing stamped page numbers into 0-indexed physical
+    page indices for write_pagination's extra_sig_pages. Stamped number N ==
+    physical page (index_end_page + N - 1). Entries outside the main range
+    are dropped with a stderr warning — those would have landed on annexures,
+    which are already signed on every page."""
+    extra_sig_physical: set = set()
+    if not sign_page_spec:
+        return extra_sig_physical
+    main_post_index_count = max(0, main_total - index_end_page)
+    kept: set = set()
+    skipped = []
+    for n in sign_page_spec:
+        if 1 <= n <= main_post_index_count:
+            kept.add(n)
+            extra_sig_physical.add(index_end_page + n - 1)
+        else:
+            skipped.append(n)
+    if kept:
+        print(
+            f"  extra signatures will land on stamped pages: "
+            f"{format_page_set(kept)} "
+            f"(physical {sorted(p + 1 for p in extra_sig_physical)})",
+            file=sys.stderr,
+        )
+    if skipped:
+        print(
+            f"  warning: --sign-pages entries outside main range "
+            f"(1..{main_post_index_count}) ignored: "
+            f"{format_page_set(set(skipped))}",
+            file=sys.stderr,
+        )
+    return extra_sig_physical
 
 
 # =============================================================================
@@ -68,11 +103,23 @@ def run_full_analysis(file_path: str, index_end_page: int, mode: str = "detect")
                   every post-index page.
       "both"    — detect + write. Same as detect plus the numbered PDF
                   in `paginated_pdf`.
+
+    All artifacts are base64-encoded into the returned dict, so the scratch
+    dir is removed on the way out (it used to leak one appeal-scan-* dir per
+    request on the long-lived dyno).
     """
+    output_dir = tempfile.mkdtemp(prefix="appeal-scan-")
+    try:
+        return _run_full_analysis(file_path, index_end_page, mode, output_dir)
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+
+def _run_full_analysis(file_path: str, index_end_page: int, mode: str, output_dir: str) -> dict:
+    """Body of run_full_analysis, operating in the caller-owned scratch dir."""
     if mode not in {"detect", "write", "both"}:
         return {"ok": False, "error": f"Invalid mode: {mode!r}. Must be detect, write, or both."}
 
-    output_dir = tempfile.mkdtemp(prefix="appeal-scan-")
     base_name = os.path.basename(file_path)
 
     # Pass-through of the merged source — frontend offers a "Download
@@ -294,110 +341,140 @@ def main():
             print(json.dumps({"ok": False, "error": f"Invalid --sign-pages: {e}"}))
             return
 
-    # Step 1: merge all main files into one base doc.
-    if len(args.file) == 1:
-        merged_path = args.file[0]
-    else:
-        tmp = tempfile.NamedTemporaryFile(suffix="_merged.pdf", delete=False)
-        tmp.close()
-        if not merge_pdfs(args.file, tmp.name):
-            print(json.dumps({"ok": False, "error": "Failed to merge input PDFs"}))
-            return
-        merged_path = tmp.name
-        print(f"Merged {len(args.file)} PDFs -> {merged_path}", file=sys.stderr)
-
-    # Snapshot the main-doc page count BEFORE appending annexures, so we
-    # can correctly bound the --sign-pages user input to the main range
-    # (annexures already get every-page signatures via append_annexures_to_pdf;
-    # we don't want to double-stamp them).
-    main_total = 0
-    if sign_page_spec and fitz:
-        with fitz.open(merged_path) as _mdoc:
-            main_total = len(_mdoc)
-
-    # Step 2: optionally append annexures (each file = one annexure) and
-    # optionally stamp client/advocate signatures on every annexure page.
-    if args.annex:
-        with_annex = tempfile.NamedTemporaryFile(suffix="_with_annex.pdf", delete=False)
-        with_annex.close()
-        if not append_annexures_to_pdf(
-            merged_path, args.annex, with_annex.name,
-            client_sig_path=args.client_sig,
-            advocate_sig_path=args.advocate_sig,
-        ):
-            print(json.dumps({"ok": False, "error": "Failed to append annexures"}))
-            return
-        target_path = with_annex.name
-        sig_note = ""
-        if args.client_sig or args.advocate_sig:
-            parts = []
-            if args.client_sig: parts.append("client")
-            if args.advocate_sig: parts.append("advocate")
-            sig_note = f" with {'+'.join(parts)} sig"
-        print(f"Appended {len(args.annex)} annexure(s){sig_note} -> {target_path}", file=sys.stderr)
-    else:
-        target_path = merged_path
-
-    # Translate the user's stamped-page numbers into 0-indexed physical
-    # page indices (the form write_pagination's extra_sig_pages set
-    # expects). Stamped number N == physical page (index_end_page + N - 1).
-    # Entries outside the main range are dropped with a stderr warning —
-    # those would have landed on annexures, which are already covered.
-    extra_sig_physical: set = set()
-    if sign_page_spec:
-        main_post_index_count = max(0, main_total - args.index_end_page)
-        kept: set = set()
-        skipped = []
-        for n in sign_page_spec:
-            if 1 <= n <= main_post_index_count:
-                kept.add(n)
-                extra_sig_physical.add(args.index_end_page + n - 1)
+    # Temps created by THIS run, removed in the finally below. Never put
+    # merged_path/target_path in here — with a single --file and no --annex
+    # they alias the user's input PDF.
+    created_temps: list = []
+    try:
+        # ── Streaming fast-path (the production hot path): ONE in-memory
+        # document flows through merge -> annexures -> pagination and is
+        # saved ONCE at the end. Profiling showed the per-stage save +
+        # reopen round trips were 54% of a write run. The JSON/report modes
+        # below keep the file-based flow — run_full_analysis re-reads the
+        # merged temp for the merged_pdf passthrough.
+        if args.write_stdout:
+            if not fitz:
+                print("PyMuPDF not installed", file=sys.stderr)
+                sys.exit(1)
+            if len(args.file) == 1:
+                try:
+                    doc = fitz.open(args.file[0])
+                except Exception as e:
+                    print(json.dumps({"ok": False, "error": f"Could not open PDF: {e}"}))
+                    return
             else:
-                skipped.append(n)
-        if kept:
-            print(
-                f"  extra signatures will land on stamped pages: "
-                f"{format_page_set(kept)} "
-                f"(physical {sorted(p + 1 for p in extra_sig_physical)})",
-                file=sys.stderr,
-            )
-        if skipped:
-            print(
-                f"  warning: --sign-pages entries outside main range "
-                f"(1..{main_post_index_count}) ignored: "
-                f"{format_page_set(set(skipped))}",
-                file=sys.stderr,
-            )
+                doc = merge_to_doc(args.file)
+                if doc is None:
+                    print(json.dumps({"ok": False, "error": "Failed to merge input PDFs"}))
+                    return
+                print(f"Merged {len(args.file)} PDFs (in-memory)", file=sys.stderr)
+            try:
+                # Main-doc page count BEFORE annexures are appended — bounds
+                # the --sign-pages input to the main range (ordering is
+                # load-bearing; annexure pages are already auto-signed).
+                main_total = len(doc)
 
-    # Streaming fast-path: write the numbered PDF directly to stdout. Skips
-    # base64, skips JSON, skips the merged_pdf passthrough — server.ts
-    # pipes this straight to the HTTP response.
-    if args.write_stdout:
-        out_tmp = tempfile.NamedTemporaryFile(suffix="_numbered.pdf", delete=False)
-        out_tmp.close()
-        # Special main pages use their OWN signature images when provided,
-        # falling back to the annexure signatures for backward compat.
-        # Annexure pages were already stamped with --client-sig/--advocate-sig
-        # in append_annexures_to_pdf above, so the two sets stay independent.
-        if not write_pagination(
-            target_path, out_tmp.name, args.index_end_page,
-            extra_sig_pages=extra_sig_physical,
-            client_sig_path=args.special_sig_client or args.client_sig,
-            advocate_sig_path=args.special_sig_advocate or args.advocate_sig,
-        ):
-            print("write_pagination failed", file=sys.stderr)
-            sys.exit(1)
-        # Stream in chunks instead of f.read(): a 300MB filing no longer
-        # doubles its footprint in this process's RAM on the way out.
-        with open(out_tmp.name, "rb") as f:
-            shutil.copyfileobj(f, sys.stdout.buffer, 1024 * 1024)
-        try:
-            os.unlink(out_tmp.name)
-        except OSError:
-            pass
-        return
+                if args.annex:
+                    if not append_annexures_to_doc(
+                        doc, args.annex,
+                        client_sig_path=args.client_sig,
+                        advocate_sig_path=args.advocate_sig,
+                    ):
+                        print(json.dumps({"ok": False, "error": "Failed to append annexures"}))
+                        return
+                    sig_note = ""
+                    if args.client_sig or args.advocate_sig:
+                        parts = []
+                        if args.client_sig: parts.append("client")
+                        if args.advocate_sig: parts.append("advocate")
+                        sig_note = f" with {'+'.join(parts)} sig"
+                    print(
+                        f"Appended {len(args.annex)} annexure(s){sig_note} (in-memory)",
+                        file=sys.stderr,
+                    )
 
-    report = run_full_analysis(target_path, args.index_end_page, args.mode)
+                extra_sig_physical = _translate_sign_pages(
+                    sign_page_spec, main_total, args.index_end_page)
+
+                # Special main pages use their OWN signature images when
+                # provided, falling back to the annexure signatures for
+                # backward compat. Annexure pages were already stamped above,
+                # so the two sets stay independent.
+                if not paginate_doc(
+                    doc, args.index_end_page,
+                    extra_sig_pages=extra_sig_physical,
+                    client_sig_path=args.special_sig_client or args.client_sig,
+                    advocate_sig_path=args.special_sig_advocate or args.advocate_sig,
+                ):
+                    print("write_pagination failed", file=sys.stderr)
+                    sys.exit(1)
+
+                out_tmp = tempfile.NamedTemporaryFile(suffix="_numbered.pdf", delete=False)
+                out_tmp.close()
+                created_temps.append(out_tmp.name)
+                doc.save(out_tmp.name, garbage=3, deflate=True)
+            finally:
+                doc.close()
+            # Stream in chunks instead of f.read(): a 300MB filing no longer
+            # doubles its footprint in this process's RAM on the way out.
+            with open(out_tmp.name, "rb") as f:
+                shutil.copyfileobj(f, sys.stdout.buffer, 1024 * 1024)
+            return
+
+        # ── JSON / report modes (detect, both, write-without-stdout) ──
+        # File-based flow, unchanged: run_full_analysis needs the merged
+        # temp on disk for the merged_pdf base64 passthrough + extraction.
+        # Step 1: merge all main files into one base doc.
+        if len(args.file) == 1:
+            merged_path = args.file[0]
+        else:
+            tmp = tempfile.NamedTemporaryFile(suffix="_merged.pdf", delete=False)
+            tmp.close()
+            created_temps.append(tmp.name)
+            if not merge_pdfs(args.file, tmp.name):
+                print(json.dumps({"ok": False, "error": "Failed to merge input PDFs"}))
+                return
+            merged_path = tmp.name
+            print(f"Merged {len(args.file)} PDFs -> {merged_path}", file=sys.stderr)
+
+        # Snapshot the main-doc page count BEFORE appending annexures, so we
+        # can correctly bound the --sign-pages user input to the main range.
+        main_total = 0
+        if sign_page_spec and fitz:
+            with fitz.open(merged_path) as _mdoc:
+                main_total = len(_mdoc)
+
+        # Step 2: optionally append annexures (each file = one annexure) and
+        # optionally stamp client/advocate signatures on every annexure page.
+        if args.annex:
+            with_annex = tempfile.NamedTemporaryFile(suffix="_with_annex.pdf", delete=False)
+            with_annex.close()
+            created_temps.append(with_annex.name)
+            if not append_annexures_to_pdf(
+                merged_path, args.annex, with_annex.name,
+                client_sig_path=args.client_sig,
+                advocate_sig_path=args.advocate_sig,
+            ):
+                print(json.dumps({"ok": False, "error": "Failed to append annexures"}))
+                return
+            target_path = with_annex.name
+            sig_note = ""
+            if args.client_sig or args.advocate_sig:
+                parts = []
+                if args.client_sig: parts.append("client")
+                if args.advocate_sig: parts.append("advocate")
+                sig_note = f" with {'+'.join(parts)} sig"
+            print(f"Appended {len(args.annex)} annexure(s){sig_note} -> {target_path}", file=sys.stderr)
+        else:
+            target_path = merged_path
+
+        report = run_full_analysis(target_path, args.index_end_page, args.mode)
+    finally:
+        for p in created_temps:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
     if len(args.file) > 1:
         report["file"] = " + ".join(os.path.basename(f) for f in args.file)
 

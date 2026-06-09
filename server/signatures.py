@@ -35,6 +35,7 @@ ink scanned on white paper; full-colour photos/logos have no white
 background to drop and should be supplied as ready-made transparent PNGs.
 """
 
+import atexit
 import os
 import sys
 from typing import Optional
@@ -119,6 +120,53 @@ def _transparent_signature(path: str) -> str:
 
     _TRANSPARENT_CACHE[path] = result
     return result
+
+
+def _cleanup_transparent_temps() -> None:
+    """Remove the chroma-keyed temp PNGs at process exit. The `value != key`
+    guard is mandatory: on PIL failure the cache stores the ORIGINAL user
+    path, which must never be deleted."""
+    for src, p in _TRANSPARENT_CACHE.items():
+        if p != src:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+atexit.register(_cleanup_transparent_temps)
+
+
+def _insert_sig_image(page, mediabox_rect, image_path: str, rotation: int) -> None:
+    """insert_image with per-DOCUMENT xref reuse: the first stamp embeds the
+    image object; every later stamp on the same document references it by
+    xref, skipping the per-call file read + digest (the same one or two
+    signature files land on every page of a filing).
+
+    The cache lives on the Document object itself, so it can never leak a
+    stale xref into a different document (annex docs, the merged doc and the
+    pagination doc are all distinct) and it dies with the doc."""
+    doc = page.parent
+    cache = getattr(doc, "_sig_xref_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            doc._sig_xref_cache = cache
+        except AttributeError:
+            pass  # exotic doc object — fall back to uncached inserts
+    xref = cache.get(image_path, 0)
+    if xref:
+        page.insert_image(
+            mediabox_rect, xref=xref,
+            keep_proportion=True, rotate=rotation,
+        )
+        return
+    new_xref = page.insert_image(
+        mediabox_rect, filename=image_path,
+        keep_proportion=True, rotate=rotation,
+    )
+    if isinstance(new_xref, int) and new_xref > 0:
+        cache[image_path] = new_xref
 
 
 def _fit_visible_rect_to_image(
@@ -317,12 +365,7 @@ def stamp_signatures_on_page(
             if visible_rect:
                 mediabox_rect = _project_to_mediabox(page, visible_rect)
                 try:
-                    page.insert_image(
-                        mediabox_rect,
-                        filename=render_path,
-                        keep_proportion=True,
-                        rotate=rotation,
-                    )
+                    _insert_sig_image(page, mediabox_rect, render_path, rotation)
                 except Exception as e:
                     print(
                         f"  client sig insert failed "
@@ -350,12 +393,7 @@ def stamp_signatures_on_page(
         visible_rect = fitz.Rect(right_x, band_top, right_x + w, band_top + h)
         mediabox_rect = _project_to_mediabox(page, visible_rect)
         try:
-            page.insert_image(
-                mediabox_rect,
-                filename=render_path,
-                keep_proportion=True,
-                rotate=rotation,
-            )
+            _insert_sig_image(page, mediabox_rect, render_path, rotation)
         except Exception as e:
             print(
                 f"  advocate sig insert failed "

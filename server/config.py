@@ -27,14 +27,32 @@ except ImportError:
         fitz = None  # type: ignore
 
 # --- Tesseract OCR (soft dependency — scanned-PDF fallback only) ----------
-try:
-    import pytesseract  # type: ignore # noqa: F401
-    from PIL import Image  # type: ignore # noqa: F401
-    import io  # noqa: F401
+# Probed lazily: the write fast path (the production hot path) never OCRs,
+# so it shouldn't pay the pytesseract+PIL import on every spawn. The probe
+# is a cached try-import of BOTH packages — NOT importlib.find_spec, which
+# reports broken installs as available and would change detect-mode behaviour.
+_TESSERACT_AVAILABLE = None  # tri-state: None = not probed yet
 
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
+
+def tesseract_available() -> bool:
+    """Lazily probe pytesseract + PIL (cached). Replaces the former eager
+    module-level TESSERACT_AVAILABLE constant."""
+    global _TESSERACT_AVAILABLE
+    if _TESSERACT_AVAILABLE is None:
+        try:
+            import pytesseract  # type: ignore # noqa: F401
+            from PIL import Image  # type: ignore # noqa: F401
+
+            _TESSERACT_AVAILABLE = True
+        except ImportError:
+            _TESSERACT_AVAILABLE = False
+    return _TESSERACT_AVAILABLE
+
+
+def __getattr__(name):  # PEP 562 — back-compat for `config.TESSERACT_AVAILABLE` readers
+    if name == "TESSERACT_AVAILABLE":
+        return tesseract_available()
+    raise AttributeError(f"module 'config' has no attribute {name!r}")
 
 # --- OCR knobs ------------------------------------------------------------
 TESSERACT_CONFIG = "--oem 3 --psm 6"

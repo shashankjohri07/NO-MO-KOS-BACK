@@ -20,38 +20,19 @@ from config import fitz
 from signatures import stamp_signatures_on_page
 
 
-def write_pagination(
-    input_path: str,
-    output_path: str,
+def paginate_doc(
+    doc,
     index_end_page: int,
     extra_sig_pages: Optional[Set[int]] = None,
     client_sig_path: Optional[str] = None,
     advocate_sig_path: Optional[str] = None,
 ) -> bool:
-    """Stamp sequential page numbers in the top-right corner of every page
-    after the user-supplied index range.
-
-    Page (index_end_page + 1) gets "1", the next gets "2", and so on.
-    Pages 1..index_end_page are left untouched.
-
-    Existing top-right content (stale numbers, registry stamps, dates, etc.)
-    is REDACTED — text spans are deleted from the content stream before
-    the new digit is drawn. A plain white draw_rect would only hide them
-    visually; the detector would still read the underlying spans.
-
-    Optional `extra_sig_pages` is a set of 0-indexed physical page
-    numbers that should ALSO receive client/advocate signatures during
-    this pass. The annexure-pages-every-page stamping has already
-    happened upstream in append_annexures_to_pdf; this hook lets the
-    user opt extra MAIN-document pages in (vakalatnama, prayer page,
-    affidavit) by listing them in the "sign which pages" input. Pages
-    not in this set are unaffected.
+    """Redact + stamp page numbers (and optional extra signatures) on the
+    OPEN document `doc`. Core of write_pagination, split out so the streaming
+    hot path can run merge -> annexures -> pagination on ONE in-memory
+    document and save once at the end. Does not save or close `doc`.
     """
-    if not fitz:
-        return False
-    doc = None
     try:
-        doc = fitz.open(input_path)
         total = len(doc)
         if index_end_page < 0 or index_end_page >= total:
             print(
@@ -139,6 +120,54 @@ def write_pagination(
                         file=sys.stderr,
                     )
 
+        return True
+    except Exception as e:
+        print(f"write_pagination error: {e}", file=sys.stderr)
+        return False
+
+
+def write_pagination(
+    input_path: str,
+    output_path: str,
+    index_end_page: int,
+    extra_sig_pages: Optional[Set[int]] = None,
+    client_sig_path: Optional[str] = None,
+    advocate_sig_path: Optional[str] = None,
+) -> bool:
+    """Stamp sequential page numbers in the top-right corner of every page
+    after the user-supplied index range.
+
+    Page (index_end_page + 1) gets "1", the next gets "2", and so on.
+    Pages 1..index_end_page are left untouched.
+
+    Existing top-right content (stale numbers, registry stamps, dates, etc.)
+    is REDACTED — text spans are deleted from the content stream before
+    the new digit is drawn. A plain white draw_rect would only hide them
+    visually; the detector would still read the underlying spans.
+
+    Optional `extra_sig_pages` is a set of 0-indexed physical page
+    numbers that should ALSO receive client/advocate signatures during
+    this pass. The annexure-pages-every-page stamping has already
+    happened upstream in append_annexures_to_pdf; this hook lets the
+    user opt extra MAIN-document pages in (vakalatnama, prayer page,
+    affidavit) by listing them in the "sign which pages" input. Pages
+    not in this set are unaffected.
+
+    File-based wrapper around paginate_doc (kept for the JSON / report
+    paths and existing callers).
+    """
+    if not fitz:
+        return False
+    doc = None
+    try:
+        doc = fitz.open(input_path)
+        if not paginate_doc(
+            doc, index_end_page,
+            extra_sig_pages=extra_sig_pages,
+            client_sig_path=client_sig_path,
+            advocate_sig_path=advocate_sig_path,
+        ):
+            return False
         doc.save(output_path, garbage=3, deflate=True)
         return True
     except Exception as e:

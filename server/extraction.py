@@ -17,7 +17,7 @@ from typing import List, Optional
 
 from config import (
     MIN_TEXT_CHARS,
-    TESSERACT_AVAILABLE,
+    tesseract_available,
     TESSERACT_CONFIG,
     TESSERACT_CONFIG_SINGLE_LINE,
     TESSERACT_DPI,
@@ -28,7 +28,7 @@ from config import (
 
 def _ocr_page_with_tesseract(doc, page_idx: int, page_num: int) -> Optional[str]:
     """OCR a single page using Tesseract. Returns None on any failure."""
-    if not TESSERACT_AVAILABLE or not fitz:
+    if not tesseract_available() or not fitz:
         return None
     try:
         # Lazy import — write-only paths never reach this code, no reason
@@ -55,7 +55,7 @@ def _ocr_topright_page_number(doc, page_idx: int) -> Optional[int]:
       Pass 2 (wider + lenient): top 14% × right 35%, full PSM 6, line-by-line.
         Filters out lines noisy with punctuation (degraded scans).
     """
-    if not TESSERACT_AVAILABLE or not fitz:
+    if not tesseract_available() or not fitz:
         return None
     try:
         import pytesseract
@@ -201,7 +201,7 @@ def extract_pages(file_path: str) -> dict:
                 ocr_pages.append(i)
 
         # Full-page OCR for scanned pages.
-        if ocr_pages and TESSERACT_AVAILABLE:
+        if ocr_pages and tesseract_available():
             print(f"{len(ocr_pages)} pages need OCR — running full-page Tesseract...",
                   file=sys.stderr)
             ocr_method = "pymupdf+tesseract"
@@ -234,7 +234,7 @@ def extract_pages(file_path: str) -> dict:
                 p["printed_num"] = None
                 needing_strip.append(p["page_num"] - 1)
 
-        if needing_strip and TESSERACT_AVAILABLE:
+        if needing_strip and tesseract_available():
             print(
                 f"Top-right strip OCR for {len(needing_strip)} pages still unnumbered...",
                 file=sys.stderr,
