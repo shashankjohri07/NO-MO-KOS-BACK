@@ -1,21 +1,49 @@
 /**
- * Event announcement emails via Resend's REST API (plain fetch, no SDK).
+ * Event announcement emails. Provider is chosen from env, in priority order:
  *
- * RESEND_API_KEY unset -> dry-run mode: nothing is sent, the call reports
- * dryRun:true with the would-be recipient count. This keeps the feature
- * deployable before the key exists and makes local testing safe — a test
- * can never accidentally blast real inboxes.
- *
- * EMAIL_FROM should be a verified sender on the Resend account, e.g.
- * "Nomikos <events@yourdomain.com>" (defaults to Resend's shared onboarding
- * sender, which works out of the box but is fine only for testing).
+ *  1. Gmail SMTP  — set GMAIL_USER + GMAIL_APP_PASSWORD (a Google "App
+ *     Password", needs 2-Step Verification on the account). Sends through
+ *     Google's own servers, so a plain @gmail.com sender is properly
+ *     authenticated and can email ANY recipient with no domain to verify.
+ *     ~500 emails/day on a normal Gmail account.
+ *  2. Resend     — set RESEND_API_KEY (needs a verified domain to email
+ *     arbitrary recipients; otherwise only the account owner's address).
+ *  3. dry-run    — neither set: nothing is sent, the call reports dryRun:true.
+ *     Safe to deploy before any provider exists.
  */
 
+import nodemailer, { type Transporter } from 'nodemailer';
 import type { EventRecord } from './store';
 
+const GMAIL_USER = process.env.GMAIL_USER || '';
+const GMAIL_APP_PASSWORD = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, ''); // Google shows it with spaces
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const EMAIL_FROM = process.env.EMAIL_FROM || 'Nomikos <onboarding@resend.dev>';
-const BATCH_SIZE = 100; // Resend's batch endpoint cap
+const EMAIL_FROM =
+  process.env.EMAIL_FROM ||
+  (GMAIL_USER ? `Nomikos <${GMAIL_USER}>` : 'Nomikos <onboarding@resend.dev>');
+const RESEND_BATCH = 100;
+
+export function emailMode(): 'gmail' | 'resend' | 'dry-run' {
+  if (GMAIL_USER && GMAIL_APP_PASSWORD) return 'gmail';
+  if (RESEND_API_KEY) return 'resend';
+  return 'dry-run';
+}
+
+// One pooled SMTP connection reused across all recipients of a blast.
+let _tx: Transporter | null = null;
+function gmailTransport(): Transporter {
+  if (!_tx) {
+    _tx = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      pool: true,
+      maxConnections: 3,
+      auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+    });
+  }
+  return _tx;
+}
 
 export function renderEventEmail(ev: EventRecord): { subject: string; html: string } {
   const dateStr = ev.event_date
@@ -63,42 +91,63 @@ export interface SendResult {
   dryRun: boolean;
 }
 
-export async function sendEventEmail(ev: EventRecord, recipients: string[]): Promise<SendResult> {
-  const { subject, html } = renderEventEmail(ev);
-
-  if (!RESEND_API_KEY) {
-    console.warn(
-      `[email] RESEND_API_KEY not set — DRY RUN. Would send "${subject}" to ${recipients.length} subscriber(s).`,
-    );
-    return { sent: recipients.length, failed: 0, dryRun: true };
-  }
-
+async function sendViaGmail(subject: string, html: string, recipients: string[]): Promise<SendResult> {
+  const tx = gmailTransport();
   let sent = 0;
   let failed = 0;
-  for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
-    const chunk = recipients.slice(i, i + BATCH_SIZE);
-    // One personal email per recipient (no exposed CC list); batched per API call.
+  // One message per recipient (no exposed recipient list). The pooled
+  // transport reuses connections, so this stays fast for modest lists.
+  for (const to of recipients) {
+    try {
+      await tx.sendMail({ from: EMAIL_FROM, to, subject, html });
+      sent++;
+    } catch (e) {
+      failed++;
+      console.error(`[email] gmail send to ${to} failed: ${e}`);
+    }
+  }
+  return { sent, failed, dryRun: false };
+}
+
+async function sendViaResend(subject: string, html: string, recipients: string[]): Promise<SendResult> {
+  let sent = 0;
+  let failed = 0;
+  for (let i = 0; i < recipients.length; i += RESEND_BATCH) {
+    const chunk = recipients.slice(i, i + RESEND_BATCH);
     const payload = chunk.map((to) => ({ from: EMAIL_FROM, to: [to], subject, html }));
     try {
       const r = await fetch('https://api.resend.com/emails/batch', {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${RESEND_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(30_000),
       });
-      if (r.ok) {
-        sent += chunk.length;
-      } else {
+      if (r.ok) sent += chunk.length;
+      else {
         failed += chunk.length;
-        console.error(`[email] batch ${i / BATCH_SIZE} failed: ${r.status} ${(await r.text()).slice(0, 300)}`);
+        console.error(`[email] resend batch ${i / RESEND_BATCH} failed: ${r.status} ${(await r.text()).slice(0, 300)}`);
       }
     } catch (e) {
       failed += chunk.length;
-      console.error(`[email] batch ${i / BATCH_SIZE} threw: ${e}`);
+      console.error(`[email] resend batch ${i / RESEND_BATCH} threw: ${e}`);
     }
   }
   return { sent, failed, dryRun: false };
+}
+
+export async function sendEventEmail(ev: EventRecord, recipients: string[]): Promise<SendResult> {
+  const { subject, html } = renderEventEmail(ev);
+  const mode = emailMode();
+
+  if (mode === 'dry-run') {
+    console.warn(
+      `[email] no provider configured — DRY RUN. Would send "${subject}" to ${recipients.length} subscriber(s).`,
+    );
+    return { sent: recipients.length, failed: 0, dryRun: true };
+  }
+  if (recipients.length === 0) return { sent: 0, failed: 0, dryRun: false };
+
+  return mode === 'gmail'
+    ? sendViaGmail(subject, html, recipients)
+    : sendViaResend(subject, html, recipients);
 }

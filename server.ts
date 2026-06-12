@@ -9,7 +9,7 @@ import fs from 'fs';
 
 import { makeStore } from './store';
 import { makeRequireAdmin, makeWhoami, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
-import { sendEventEmail } from './email';
+import { sendEventEmail, emailMode } from './email';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -42,7 +42,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // event emails go out through Resend (dry-run until RESEND_API_KEY is set).
 const store = makeStore();
 const requireAdmin = makeRequireAdmin(store);
-console.log(`[admin] store=${store.kind}, email=${process.env.RESEND_API_KEY ? 'resend' : 'DRY-RUN'}`);
+console.log(`[admin] store=${store.kind}, email=${emailMode()}`);
 
 // Called by the frontend after a successful login/signup so the customer
 // list fills itself — no auth-service DB access needed. Idempotent upsert.
