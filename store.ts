@@ -31,6 +31,19 @@ export interface Subscriber {
   created_at: string;
 }
 
+export interface ToolStat {
+  tool: string;
+  count: number;
+}
+
+export interface FeedbackEntry {
+  id: string;
+  email: string | null;
+  message: string;
+  tool: string | null;
+  created_at: string;
+}
+
 export interface Store {
   addSubscriber(email: string): Promise<void>;
   listSubscribers(): Promise<Subscriber[]>;
@@ -41,6 +54,10 @@ export interface Store {
   createEvent(e: Omit<EventRecord, 'id' | 'created_at' | 'sent_at' | 'sent_count'>): Promise<EventRecord>;
   markEventSent(id: string, sentCount: number): Promise<void>;
   listEvents(): Promise<EventRecord[]>;
+  trackTool(tool: string): Promise<void>;
+  getToolStats(): Promise<ToolStat[]>;
+  submitFeedback(entry: { email?: string | null; message: string; tool?: string | null }): Promise<void>;
+  listFeedback(): Promise<FeedbackEntry[]>;
   kind: string;
 }
 
@@ -119,6 +136,53 @@ class SupabaseStore implements Store {
   async listEvents(): Promise<EventRecord[]> {
     return (await this.req('events?select=*&order=created_at.desc&limit=100')) ?? [];
   }
+
+  async trackTool(tool: string): Promise<void> {
+    try {
+      await this.req('tool_events', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ tool }),
+      });
+    } catch (e) {
+      console.warn(`[store] trackTool failed (table may not exist yet): ${e}`);
+    }
+  }
+
+  async getToolStats(): Promise<ToolStat[]> {
+    try {
+      const rows: { tool: string }[] = (await this.req('tool_events?select=tool')) ?? [];
+      const counts: Record<string, number> = {};
+      for (const r of rows) counts[r.tool] = (counts[r.tool] || 0) + 1;
+      return Object.entries(counts)
+        .map(([tool, count]) => ({ tool, count }))
+        .sort((a, b) => b.count - a.count);
+    } catch (e) {
+      console.warn(`[store] getToolStats failed: ${e}`);
+      return [];
+    }
+  }
+
+  async submitFeedback(entry: { email?: string | null; message: string; tool?: string | null }): Promise<void> {
+    try {
+      await this.req('feedback', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify(entry),
+      });
+    } catch (e) {
+      console.warn(`[store] submitFeedback failed (table may not exist yet): ${e}`);
+    }
+  }
+
+  async listFeedback(): Promise<FeedbackEntry[]> {
+    try {
+      return (await this.req('feedback?select=*&order=created_at.desc&limit=200')) ?? [];
+    } catch (e) {
+      console.warn(`[store] listFeedback failed: ${e}`);
+      return [];
+    }
+  }
 }
 
 // ── JSON-file fallback (dev / unconfigured) ────────────────────────────────
@@ -127,6 +191,8 @@ interface FileShape {
   subscribers: Subscriber[];
   events: EventRecord[];
   admin_roles: string[];
+  tool_events: { tool: string; created_at: string }[];
+  feedback: FeedbackEntry[];
 }
 
 class FileStore implements Store {
@@ -135,9 +201,12 @@ class FileStore implements Store {
 
   private read(): FileShape {
     try {
-      return JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      const d = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      d.tool_events ??= [];
+      d.feedback ??= [];
+      return d;
     } catch {
-      return { subscribers: [], events: [], admin_roles: [] };
+      return { subscribers: [], events: [], admin_roles: [], tool_events: [], feedback: [] };
     }
   }
 
@@ -206,6 +275,36 @@ class FileStore implements Store {
 
   async listEvents(): Promise<EventRecord[]> {
     return this.read().events;
+  }
+
+  async trackTool(tool: string): Promise<void> {
+    const d = this.read();
+    d.tool_events.push({ tool, created_at: new Date().toISOString() });
+    this.write(d);
+  }
+
+  async getToolStats(): Promise<ToolStat[]> {
+    const counts: Record<string, number> = {};
+    for (const e of this.read().tool_events) counts[e.tool] = (counts[e.tool] || 0) + 1;
+    return Object.entries(counts)
+      .map(([tool, count]) => ({ tool, count }))
+      .sort((a, b) => b.count - a.count);
+  }
+
+  async submitFeedback(entry: { email?: string | null; message: string; tool?: string | null }): Promise<void> {
+    const d = this.read();
+    d.feedback.push({
+      id: `fb_${Date.now()}`,
+      email: entry.email ?? null,
+      message: entry.message,
+      tool: entry.tool ?? null,
+      created_at: new Date().toISOString(),
+    });
+    this.write(d);
+  }
+
+  async listFeedback(): Promise<FeedbackEntry[]> {
+    return [...this.read().feedback].reverse();
   }
 }
 

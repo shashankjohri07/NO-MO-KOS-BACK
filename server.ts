@@ -237,6 +237,47 @@ app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Resp
   }
 });
 
+// Fire-and-forget tool usage tracking — no auth, ignores failures silently.
+app.post('/api/track', async (req: Request, res: Response) => {
+  const tool = String(req.body?.tool ?? '').trim().slice(0, 50);
+  if (tool) store.trackTool(tool).catch(() => {});
+  res.json({ ok: true });
+});
+
+// User feedback submission — no auth required.
+app.post('/api/feedback', async (req: Request, res: Response) => {
+  const message = String(req.body?.message ?? '').trim().slice(0, 2000);
+  if (!message) { res.status(400).json({ ok: false, error: 'message required' }); return; }
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().slice(0, 200) : null;
+  const tool = typeof req.body?.tool === 'string' ? req.body.tool.trim().slice(0, 50) : null;
+  try {
+    await store.submitFeedback({ email: email || null, message, tool: tool || null });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Could not save feedback' });
+  }
+});
+
+// Admin: tool usage stats.
+app.get('/api/admin/tool-stats', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const stats = await store.getToolStats();
+    res.json({ ok: true, stats });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Could not load tool stats' });
+  }
+});
+
+// Admin: list feedback entries.
+app.get('/api/admin/feedback', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const entries = await store.listFeedback();
+    res.json({ ok: true, entries });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Could not load feedback' });
+  }
+});
+
 // Send a test email to the requesting admin only (no event saved, no blast).
 app.post('/api/admin/events/test-send', requireAdmin, async (req: AuthedRequest, res: Response) => {
   const { title, description, event_date, image_url, link_url } = req.body ?? {};
