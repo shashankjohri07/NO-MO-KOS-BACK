@@ -9,7 +9,7 @@ import fs from 'fs';
 
 import { makeStore } from './store';
 import { makeRequireAdmin, makeWhoami, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
-import { sendEventEmail, emailMode } from './email';
+import { sendEventEmail, emailMode, renderEventEmail } from './email';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -234,6 +234,34 @@ app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Resp
   } catch (e) {
     console.error(`[admin/events] create: ${e}`);
     res.status(500).json({ ok: false, error: 'Could not create event' });
+  }
+});
+
+// Send a test email to the requesting admin only (no event saved, no blast).
+app.post('/api/admin/events/test-send', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const { title, description, event_date, image_url, link_url } = req.body ?? {};
+  if (!title || typeof title !== 'string' || !description || typeof description !== 'string') {
+    res.status(400).json({ ok: false, error: 'title and description are required' });
+    return;
+  }
+  const ev = {
+    id: 'test',
+    title: String(title).trim().slice(0, 200),
+    description: String(description).trim().slice(0, 5000),
+    event_date: typeof event_date === 'string' ? event_date.slice(0, 10) : '',
+    image_url: typeof image_url === 'string' && image_url.trim() ? image_url.trim() : null,
+    link_url: typeof link_url === 'string' && link_url.trim() ? link_url.trim() : null,
+    created_by: req.userEmail || 'test',
+    created_at: new Date().toISOString(),
+    sent_at: null,
+    sent_count: 0,
+  };
+  try {
+    const result = await sendEventEmail(ev, [req.userEmail!]);
+    res.json({ ok: true, sent: result.sent, dryRun: result.dryRun });
+  } catch (e) {
+    console.error(`[admin/test-send] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not send test email' });
   }
 });
 
