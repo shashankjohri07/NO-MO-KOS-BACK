@@ -7,6 +7,10 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs';
 
+import { makeStore } from './store';
+import { makeRequireAdmin, makeWhoami, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
+import { sendEventEmail } from './email';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -30,6 +34,207 @@ app.use(express.json({ limit: '200mb' }));
 
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ── Admin / events / subscribers ────────────────────────────────────────────
+// Data lives in the store (Supabase in prod, JSON-file fallback in dev);
+// identity is verified by forwarding the session cookie to the auth service;
+// event emails go out through Resend (dry-run until RESEND_API_KEY is set).
+const store = makeStore();
+const requireAdmin = makeRequireAdmin(store);
+console.log(`[admin] store=${store.kind}, email=${process.env.RESEND_API_KEY ? 'resend' : 'DRY-RUN'}`);
+
+// Called by the frontend after a successful login/signup so the customer
+// list fills itself — no auth-service DB access needed. Idempotent upsert.
+app.post('/api/subscribe', async (req: Request, res: Response) => {
+  const email = String(req.body?.email ?? '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    res.status(400).json({ ok: false, error: 'Invalid email' });
+    return;
+  }
+  try {
+    await store.addSubscriber(email);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[subscribe] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not save subscription' });
+  }
+});
+
+// The frontend asks this to decide whether to show the admin UI.
+app.get('/api/admin/whoami', makeWhoami(store));
+
+app.get('/api/admin/events', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    res.json({ ok: true, events: await store.listEvents() });
+  } catch (e) {
+    console.error(`[admin/events] list: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load events' });
+  }
+});
+
+app.get('/api/admin/subscribers', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const subs = await store.listSubscribers();
+    res.json({ ok: true, count: subs.length, subscribers: subs });
+  } catch (e) {
+    console.error(`[admin/subscribers] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load subscribers' });
+  }
+});
+
+// Dashboard stats — derived from the subscriber list (created_at = first time
+// we saw a user) and the event log. All counts are "since the events feature
+// went live", since that's the only user data we own (the auth service's DB
+// is separate).
+app.get('/api/admin/stats', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const [subs, events] = await Promise.all([store.listSubscribers(), store.listEvents()]);
+    const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const now = new Date();
+    const todayStart = startOfDay(now);
+    const weekStart = todayStart - 6 * 86400_000;
+
+    let today = 0;
+    let week = 0;
+    // New users per day for the last 14 days (oldest -> newest) for the chart.
+    const DAYS = 14;
+    const buckets: { date: string; count: number }[] = [];
+    const idx: Record<string, number> = {};
+    for (let i = DAYS - 1; i >= 0; i--) {
+      const d = new Date(todayStart - i * 86400_000);
+      const key = d.toISOString().slice(0, 10);
+      idx[key] = buckets.length;
+      buckets.push({ date: key, count: 0 });
+    }
+    for (const s of subs) {
+      const t = new Date(s.created_at).getTime();
+      if (t >= todayStart) today++;
+      if (t >= weekStart) week++;
+      const key = new Date(s.created_at).toISOString().slice(0, 10);
+      if (key in idx) buckets[idx[key]].count++;
+    }
+
+    const emailsSent = events.reduce((a, e) => a + (e.sent_count || 0), 0);
+
+    res.json({
+      ok: true,
+      stats: {
+        totalUsers: subs.length,
+        newToday: today,
+        newThisWeek: week,
+        totalEvents: events.length,
+        emailsSent,
+        perDay: buckets,
+      },
+    });
+  } catch (e) {
+    console.error(`[admin/stats] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load stats' });
+  }
+});
+
+// ── Manage admins ──
+// Returns DB-granted admins (removable) plus the env/bootstrap admins
+// (protected — config, not data, so they cannot be removed from the UI and
+// nobody can lock the owner out).
+app.get('/api/admin/admins', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const dbAdmins = await store.listAdmins();
+    const env = [...ENV_ADMIN_EMAILS];
+    const removable = dbAdmins.filter((e) => !ENV_ADMIN_EMAILS.has(e));
+    res.json({
+      ok: true,
+      admins: [
+        ...env.map((email) => ({ email, protected: true })),
+        ...removable.map((email) => ({ email, protected: false })),
+      ],
+    });
+  } catch (e) {
+    console.error(`[admin/admins] list: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load admins' });
+  }
+});
+
+// Promote any email to admin. requireAdmin already guarantees the caller is an
+// admin, so nobody can self-promote — only an existing admin can grant.
+app.post('/api/admin/admins', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const email = String(req.body?.email ?? '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    res.status(400).json({ ok: false, error: 'Invalid email' });
+    return;
+  }
+  try {
+    if (ENV_ADMIN_EMAILS.has(email)) {
+      res.json({ ok: true, alreadyProtected: true }); // already a bootstrap admin
+      return;
+    }
+    await store.addAdmin(email);
+    console.log(`[admin/admins] ${req.userEmail} granted admin to ${email}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[admin/admins] add: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not add admin' });
+  }
+});
+
+// Revoke a DB-granted admin. Protected (env/bootstrap) admins and the caller
+// themselves cannot be removed — prevents lockout and demoting the owner.
+app.delete('/api/admin/admins', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const email = String(req.body?.email ?? '').trim().toLowerCase();
+  if (ENV_ADMIN_EMAILS.has(email)) {
+    res.status(400).json({ ok: false, error: 'This admin is protected (configured in env) and cannot be removed here.' });
+    return;
+  }
+  if (email === req.userEmail) {
+    res.status(400).json({ ok: false, error: 'You cannot remove your own admin access.' });
+    return;
+  }
+  try {
+    await store.removeAdmin(email);
+    console.log(`[admin/admins] ${req.userEmail} revoked admin from ${email}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[admin/admins] remove: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not remove admin' });
+  }
+});
+
+// Create an event; when sendNow is true, blast the announcement to every
+// subscriber and record the sent count on the event.
+app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const { title, description, event_date, image_url, link_url, sendNow } = req.body ?? {};
+  if (!title || typeof title !== 'string' || !description || typeof description !== 'string') {
+    res.status(400).json({ ok: false, error: 'title and description are required' });
+    return;
+  }
+  try {
+    const event = await store.createEvent({
+      title: title.trim().slice(0, 200),
+      description: String(description).trim().slice(0, 5000),
+      event_date: typeof event_date === 'string' ? event_date.slice(0, 10) : '',
+      image_url: typeof image_url === 'string' && image_url.trim() ? image_url.trim() : null,
+      link_url: typeof link_url === 'string' && link_url.trim() ? link_url.trim() : null,
+      created_by: req.userEmail || 'unknown',
+    });
+
+    let send = null;
+    if (sendNow) {
+      const subscribers = await store.listSubscribers();
+      const result = await sendEventEmail(event, subscribers.map((s) => s.email));
+      await store.markEventSent(event.id, result.sent);
+      event.sent_at = new Date().toISOString();
+      event.sent_count = result.sent;
+      send = result;
+      console.log(
+        `[admin/events] "${event.title}" by ${req.userEmail}: sent=${result.sent} failed=${result.failed}${result.dryRun ? ' (DRY RUN)' : ''}`,
+      );
+    }
+    res.json({ ok: true, event, send });
+  } catch (e) {
+    console.error(`[admin/events] create: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not create event' });
+  }
 });
 
 app.post('/api/detect-errors', upload.array('document', 5), async (req: Request, res: Response) => {

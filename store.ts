@@ -1,0 +1,222 @@
+/**
+ * Data layer for the admin/events feature: events, subscribers, admin roles.
+ *
+ * Two backends behind one interface:
+ *  - SupabaseStore — production. Talks to Supabase's PostgREST API with plain
+ *    fetch (no SDK dependency). Requires SUPABASE_URL + SUPABASE_SERVICE_KEY
+ *    env vars and the tables created by the SQL in README-ADMIN.md.
+ *  - FileStore — dev fallback when Supabase env is missing. A JSON file under
+ *    /tmp; fine for local testing, EPHEMERAL on Render (lost on redeploy) —
+ *    production must configure Supabase.
+ */
+
+import fs from 'fs';
+import path from 'path';
+
+export interface EventRecord {
+  id: string;
+  title: string;
+  description: string;
+  event_date: string; // ISO date
+  image_url: string | null;
+  link_url: string | null;
+  created_by: string;
+  created_at: string;
+  sent_at: string | null;
+  sent_count: number;
+}
+
+export interface Subscriber {
+  email: string;
+  created_at: string;
+}
+
+export interface Store {
+  addSubscriber(email: string): Promise<void>;
+  listSubscribers(): Promise<Subscriber[]>;
+  isAdmin(email: string): Promise<boolean>;
+  addAdmin(email: string): Promise<void>;
+  removeAdmin(email: string): Promise<void>;
+  listAdmins(): Promise<string[]>;
+  createEvent(e: Omit<EventRecord, 'id' | 'created_at' | 'sent_at' | 'sent_count'>): Promise<EventRecord>;
+  markEventSent(id: string, sentCount: number): Promise<void>;
+  listEvents(): Promise<EventRecord[]>;
+  kind: string;
+}
+
+// ── Supabase (PostgREST over fetch) ────────────────────────────────────────
+
+class SupabaseStore implements Store {
+  kind = 'supabase';
+  constructor(private url: string, private key: string) {}
+
+  private async req(pathQs: string, init: RequestInit = {}): Promise<any> {
+    const r = await fetch(`${this.url}/rest/v1/${pathQs}`, {
+      ...init,
+      headers: {
+        apikey: this.key,
+        Authorization: `Bearer ${this.key}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+        ...(init.headers || {}),
+      },
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      throw new Error(`supabase ${init.method || 'GET'} ${pathQs}: ${r.status} ${body.slice(0, 200)}`);
+    }
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  }
+
+  async addSubscriber(email: string): Promise<void> {
+    // Upsert on the email PK — repeat logins are a no-op.
+    await this.req('subscribers?on_conflict=email', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=ignore-duplicates' },
+      body: JSON.stringify({ email }),
+    });
+  }
+
+  async listSubscribers(): Promise<Subscriber[]> {
+    return (await this.req('subscribers?select=email,created_at&order=created_at.asc')) ?? [];
+  }
+
+  async isAdmin(email: string): Promise<boolean> {
+    const rows = await this.req(`admin_roles?select=email&email=eq.${encodeURIComponent(email)}`);
+    return Array.isArray(rows) && rows.length > 0;
+  }
+
+  async addAdmin(email: string): Promise<void> {
+    await this.req('admin_roles?on_conflict=email', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=ignore-duplicates' },
+      body: JSON.stringify({ email }),
+    });
+  }
+
+  async removeAdmin(email: string): Promise<void> {
+    await this.req(`admin_roles?email=eq.${encodeURIComponent(email)}`, { method: 'DELETE' });
+  }
+
+  async listAdmins(): Promise<string[]> {
+    const rows = await this.req('admin_roles?select=email&order=email.asc');
+    return Array.isArray(rows) ? rows.map((r: any) => r.email) : [];
+  }
+
+  async createEvent(e: Omit<EventRecord, 'id' | 'created_at' | 'sent_at' | 'sent_count'>): Promise<EventRecord> {
+    const rows = await this.req('events', { method: 'POST', body: JSON.stringify(e) });
+    return rows[0];
+  }
+
+  async markEventSent(id: string, sentCount: number): Promise<void> {
+    await this.req(`events?id=eq.${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sent_at: new Date().toISOString(), sent_count: sentCount }),
+    });
+  }
+
+  async listEvents(): Promise<EventRecord[]> {
+    return (await this.req('events?select=*&order=created_at.desc&limit=100')) ?? [];
+  }
+}
+
+// ── JSON-file fallback (dev / unconfigured) ────────────────────────────────
+
+interface FileShape {
+  subscribers: Subscriber[];
+  events: EventRecord[];
+  admin_roles: string[];
+}
+
+class FileStore implements Store {
+  kind = 'file';
+  constructor(private file: string) {}
+
+  private read(): FileShape {
+    try {
+      return JSON.parse(fs.readFileSync(this.file, 'utf8'));
+    } catch {
+      return { subscribers: [], events: [], admin_roles: [] };
+    }
+  }
+
+  private write(d: FileShape): void {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    fs.writeFileSync(this.file, JSON.stringify(d, null, 2));
+  }
+
+  async addSubscriber(email: string): Promise<void> {
+    const d = this.read();
+    if (!d.subscribers.some((s) => s.email === email)) {
+      d.subscribers.push({ email, created_at: new Date().toISOString() });
+      this.write(d);
+    }
+  }
+
+  async listSubscribers(): Promise<Subscriber[]> {
+    return this.read().subscribers;
+  }
+
+  async isAdmin(email: string): Promise<boolean> {
+    return this.read().admin_roles.includes(email);
+  }
+
+  async addAdmin(email: string): Promise<void> {
+    const d = this.read();
+    if (!d.admin_roles.includes(email)) {
+      d.admin_roles.push(email);
+      this.write(d);
+    }
+  }
+
+  async removeAdmin(email: string): Promise<void> {
+    const d = this.read();
+    d.admin_roles = d.admin_roles.filter((e) => e !== email);
+    this.write(d);
+  }
+
+  async listAdmins(): Promise<string[]> {
+    return this.read().admin_roles;
+  }
+
+  async createEvent(e: Omit<EventRecord, 'id' | 'created_at' | 'sent_at' | 'sent_count'>): Promise<EventRecord> {
+    const d = this.read();
+    const rec: EventRecord = {
+      ...e,
+      id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      created_at: new Date().toISOString(),
+      sent_at: null,
+      sent_count: 0,
+    };
+    d.events.unshift(rec);
+    this.write(d);
+    return rec;
+  }
+
+  async markEventSent(id: string, sentCount: number): Promise<void> {
+    const d = this.read();
+    const ev = d.events.find((x) => x.id === id);
+    if (ev) {
+      ev.sent_at = new Date().toISOString();
+      ev.sent_count = sentCount;
+      this.write(d);
+    }
+  }
+
+  async listEvents(): Promise<EventRecord[]> {
+    return this.read().events;
+  }
+}
+
+export function makeStore(): Store {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (url && key) return new SupabaseStore(url.replace(/\/+$/, ''), key);
+  const file = process.env.DATA_FILE || '/tmp/nomikos-admin-data.json';
+  console.warn(
+    `[store] SUPABASE_URL/SUPABASE_SERVICE_KEY not set — using ephemeral file store at ${file}. ` +
+      'Configure Supabase before relying on this in production.',
+  );
+  return new FileStore(file);
+}
