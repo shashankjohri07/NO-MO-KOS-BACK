@@ -35,8 +35,8 @@ function gmailTransport(): Transporter {
   if (!_tx) {
     _tx = nodemailer.createTransport({
       host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
+      port: 587,
+      secure: false,
       pool: true,
       maxConnections: 3,
       auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
