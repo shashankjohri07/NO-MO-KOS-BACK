@@ -37,9 +37,11 @@ function gmailTransport(): Transporter {
       host: 'smtp.gmail.com',
       port: 587,
       secure: false,
+      requireTLS: true,   // force STARTTLS — prevents plaintext auth fallback
       pool: true,
       maxConnections: 3,
       auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+      tls: { rejectUnauthorized: true },
     });
   }
   return _tx;
@@ -101,9 +103,11 @@ async function sendViaGmail(subject: string, html: string, recipients: string[])
     try {
       await tx.sendMail({ from: EMAIL_FROM, to, subject, html });
       sent++;
-    } catch (e) {
+    } catch (e: unknown) {
       failed++;
-      console.error(`[email] gmail send to ${to} failed: ${e}`);
+      const code = (e as { code?: string; responseCode?: number })?.code;
+      const resp = (e as { response?: string })?.response;
+      console.error(`[email] gmail send to ${to} failed: code=${code} resp=${resp} err=${e}`);
     }
   }
   return { sent, failed, dryRun: false };
