@@ -58,6 +58,9 @@ export interface Store {
   getToolStats(): Promise<ToolStat[]>;
   submitFeedback(entry: { email?: string | null; message: string; tool?: string | null }): Promise<void>;
   listFeedback(): Promise<FeedbackEntry[]>;
+  // Generic JSON key-value config (product tags, feature flags, …).
+  getConfig(key: string): Promise<unknown | null>;
+  setConfig(key: string, value: unknown): Promise<void>;
   kind: string;
 }
 
@@ -183,6 +186,25 @@ class SupabaseStore implements Store {
       return [];
     }
   }
+
+  // Table: app_config(key text primary key, value jsonb) — see README-ADMIN.md.
+  async getConfig(key: string): Promise<unknown | null> {
+    try {
+      const rows = await this.req(`app_config?select=value&key=eq.${encodeURIComponent(key)}`);
+      return Array.isArray(rows) && rows.length > 0 ? rows[0].value : null;
+    } catch (e) {
+      console.warn(`[store] getConfig(${key}) failed (table may not exist yet): ${e}`);
+      return null;
+    }
+  }
+
+  async setConfig(key: string, value: unknown): Promise<void> {
+    await this.req('app_config?on_conflict=key', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates' },
+      body: JSON.stringify({ key, value }),
+    });
+  }
 }
 
 // ── JSON-file fallback (dev / unconfigured) ────────────────────────────────
@@ -193,6 +215,7 @@ interface FileShape {
   admin_roles: string[];
   tool_events: { tool: string; created_at: string }[];
   feedback: FeedbackEntry[];
+  app_config: Record<string, unknown>;
 }
 
 class FileStore implements Store {
@@ -204,9 +227,10 @@ class FileStore implements Store {
       const d = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       d.tool_events ??= [];
       d.feedback ??= [];
+      d.app_config ??= {};
       return d;
     } catch {
-      return { subscribers: [], events: [], admin_roles: [], tool_events: [], feedback: [] };
+      return { subscribers: [], events: [], admin_roles: [], tool_events: [], feedback: [], app_config: {} };
     }
   }
 
@@ -305,6 +329,16 @@ class FileStore implements Store {
 
   async listFeedback(): Promise<FeedbackEntry[]> {
     return [...this.read().feedback].reverse();
+  }
+
+  async getConfig(key: string): Promise<unknown | null> {
+    return this.read().app_config[key] ?? null;
+  }
+
+  async setConfig(key: string, value: unknown): Promise<void> {
+    const d = this.read();
+    d.app_config[key] = value;
+    this.write(d);
   }
 }
 

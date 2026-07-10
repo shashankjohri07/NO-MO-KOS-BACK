@@ -56,6 +56,12 @@ create table if not exists events (
   sent_at timestamptz,
   sent_count int not null default 0
 );
+
+-- Generic JSON config (product card tags etc., edited from the admin UI)
+create table if not exists app_config (
+  key text primary key,
+  value jsonb not null
+);
 ```
 
 The backend uses the **service_role** key over PostgREST, which bypasses Row

@@ -237,6 +237,49 @@ app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Resp
   }
 });
 
+// ── Product tag config ──────────────────────────────────────────────────
+// The landing/products page reads its card tags ("Live", "New", …) from
+// here so an admin can change them without a code deploy. Public read;
+// admin-only write. Shape: { [productKey]: { tag, tagVariant } }.
+const TAG_VARIANTS = new Set(['live', 'soon', 'later']);
+
+app.get('/api/products/config', async (_req: Request, res: Response) => {
+  try {
+    const tags = (await store.getConfig('product_tags')) ?? {};
+    res.json({ ok: true, tags });
+  } catch (e) {
+    console.error(`[products/config] get: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load product config' });
+  }
+});
+
+app.put('/api/admin/products/config', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const raw = req.body?.tags;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).length > 50) {
+    res.status(400).json({ ok: false, error: 'tags must be an object keyed by product' });
+    return;
+  }
+  const tags: Record<string, { tag: string; tagVariant: string }> = {};
+  for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
+    const entry = v as { tag?: unknown; tagVariant?: unknown };
+    const tag = String(entry?.tag ?? '').trim().slice(0, 30);
+    const tagVariant = String(entry?.tagVariant ?? '').trim();
+    if (!tag || !TAG_VARIANTS.has(tagVariant)) {
+      res.status(400).json({ ok: false, error: `Invalid tag entry for "${key}"` });
+      return;
+    }
+    tags[key.slice(0, 50)] = { tag, tagVariant };
+  }
+  try {
+    await store.setConfig('product_tags', tags);
+    console.log(`[products/config] updated by ${req.userEmail}: ${JSON.stringify(tags)}`);
+    res.json({ ok: true, tags });
+  } catch (e) {
+    console.error(`[products/config] set: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not save product config' });
+  }
+});
+
 // Fire-and-forget tool usage tracking — no auth, ignores failures silently.
 app.post('/api/track', async (req: Request, res: Response) => {
   const tool = String(req.body?.tool ?? '').trim().slice(0, 50);
