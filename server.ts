@@ -722,6 +722,89 @@ app.post('/api/bookmarks/apply', upload.array('document', 5), (req: Request, res
   });
 });
 
+// ── Index page generator ─────────────────────────────────────────────────
+// Renders a court-filing "Master Index" page from the case details the user
+// typed (court, case numbers, parties, rows, advocates, place/date). When
+// document PDFs are attached, the index is prepended to the merged result;
+// otherwise the index alone comes back. Payload travels as a JSON string
+// form field and is handed to Python via a temp file (same reason as the
+// bookmarks apply route — argv length limits).
+app.post('/api/index/generate', upload.array('document', 5), (req: Request, res: Response) => {
+  const files = (req.files as Express.Multer.File[]) ?? [];
+  const paths = files.map((f) => f.path);
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(String(req.body?.payload ?? ''));
+  } catch {
+    payload = null;
+  }
+  const rows = (payload as { rows?: unknown[] } | null)?.rows;
+  if (!payload || typeof payload !== 'object' || !Array.isArray(rows) || rows.length === 0 || rows.length > 500) {
+    for (const p of paths) fs.unlink(p, () => {});
+    res.status(400).json({ ok: false, error: 'payload must include a non-empty rows array' });
+    return;
+  }
+  const payloadPath = join(UPLOAD_DIR, `index-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(payloadPath, JSON.stringify(payload));
+
+  const cleanup = () => {
+    for (const p of [...paths, payloadPath]) fs.unlink(p, () => {});
+  };
+
+  console.log(
+    `[index/generate] ${rows.length} row(s)${files.length ? `, prepending to ${files.map((f) => f.originalname).join(' + ')}` : ' (index only)'}`,
+  );
+
+  const args = [join(__dirname, 'server', 'index_page.py'), 'generate', '--payload', payloadPath];
+  for (const p of paths) args.push('--file', p);
+
+  const proc = spawn('python3', args, {
+    cwd: join(__dirname, 'server'),
+    env: {
+      ...process.env,
+      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
+      PYTHONPATH: join(__dirname, 'server'),
+    },
+    timeout: 600_000,
+  });
+
+  const baseName = files[0]?.originalname.replace(/\.pdf$/i, '') || 'index';
+  const downloadName = files.length ? `INDEXED_${baseName}.pdf` : 'INDEX.pdf';
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+
+  proc.stdout.pipe(res);
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (d: Buffer) => {
+    const line = d.toString().trim();
+    if (line) console.log(`[index/generate] ${line}`);
+    stderrBuf += line + '\n';
+  });
+
+  proc.on('close', (code: number | null) => {
+    cleanup();
+    if (code !== 0 && !res.writableEnded) {
+      console.error(`[index/generate] python exited ${code}: ${stderrBuf.substring(0, 500)}`);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: stderrBuf || `python exited ${code}` });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  proc.on('error', (err: Error) => {
+    cleanup();
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, error: `Process error: ${err.message}` });
+    } else {
+      res.end();
+    }
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`API server running on http://localhost:${PORT}`);
 });
