@@ -581,6 +581,147 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   });
 });
 
+// ── Bookmarks ────────────────────────────────────────────────────────────
+// Stateless two-step flow, same spawn pattern as write-pagination:
+//   detect  → upload PDF(s), get back a proposed heading tree as JSON. The
+//             frontend renders it for review; nothing is stored server-side.
+//   apply   → upload the SAME PDF(s) plus the user-finalized headings JSON,
+//             stream back the PDF with the TOC injected.
+
+app.post('/api/bookmarks/detect', upload.array('document', 5), (req: Request, res: Response) => {
+  const files = (req.files as Express.Multer.File[]) ?? [];
+  if (files.length === 0) {
+    res.status(400).json({ ok: false, error: 'No file uploaded' });
+    return;
+  }
+  const paths = files.map((f) => f.path);
+  const cleanup = () => {
+    for (const p of paths) fs.unlink(p, () => {});
+  };
+
+  console.log(
+    `[bookmarks/detect] ${files.length} file(s): ${files.map((f) => f.originalname).join(' + ')}`,
+  );
+
+  const args = [join(__dirname, 'server', 'bookmarks.py'), 'detect'];
+  for (const p of paths) args.push('--file', p);
+
+  const proc = spawn('python3', args, {
+    cwd: join(__dirname, 'server'),
+    env: {
+      ...process.env,
+      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
+      PYTHONPATH: join(__dirname, 'server'),
+    },
+    timeout: 300_000,
+  });
+
+  let stdoutBuf = '';
+  let stderrBuf = '';
+  proc.stdout.on('data', (d: Buffer) => (stdoutBuf += d.toString()));
+  proc.stderr.on('data', (d: Buffer) => (stderrBuf += d.toString()));
+
+  proc.on('close', (code: number | null) => {
+    cleanup();
+    if (code !== 0) {
+      console.error(`[bookmarks/detect] python exited ${code}: ${stderrBuf.substring(0, 500)}`);
+      res.status(500).json({ ok: false, error: 'Bookmark detection failed' });
+      return;
+    }
+    try {
+      res.json(JSON.parse(stdoutBuf));
+    } catch {
+      res.status(500).json({ ok: false, error: 'Invalid detection output' });
+    }
+  });
+
+  proc.on('error', (err: Error) => {
+    cleanup();
+    res.status(500).json({ ok: false, error: `Process error: ${err.message}` });
+  });
+});
+
+app.post('/api/bookmarks/apply', upload.array('document', 5), (req: Request, res: Response) => {
+  const files = (req.files as Express.Multer.File[]) ?? [];
+  if (files.length === 0) {
+    res.status(400).json({ ok: false, error: 'No file uploaded' });
+    return;
+  }
+  const paths = files.map((f) => f.path);
+
+  // The finalized tree arrives as a JSON string form field. Parse to
+  // validate + cap size, then hand it to Python via a temp file (argv has
+  // length limits; a 1000-entry tree would blow past them).
+  let headings: unknown;
+  try {
+    headings = JSON.parse(String(req.body?.headings ?? ''));
+  } catch {
+    headings = null;
+  }
+  if (!Array.isArray(headings) || headings.length === 0 || headings.length > 2000) {
+    for (const p of paths) fs.unlink(p, () => {});
+    res.status(400).json({ ok: false, error: 'headings must be a non-empty JSON array' });
+    return;
+  }
+  const tocPath = join(UPLOAD_DIR, `toc-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(tocPath, JSON.stringify(headings));
+
+  const cleanup = () => {
+    for (const p of [...paths, tocPath]) fs.unlink(p, () => {});
+  };
+
+  console.log(
+    `[bookmarks/apply] ${files.length} file(s), ${headings.length} bookmark(s): ${files.map((f) => f.originalname).join(' + ')}`,
+  );
+
+  const args = [join(__dirname, 'server', 'bookmarks.py'), 'apply', '--toc-json', tocPath];
+  for (const p of paths) args.push('--file', p);
+
+  const proc = spawn('python3', args, {
+    cwd: join(__dirname, 'server'),
+    env: {
+      ...process.env,
+      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
+      PYTHONPATH: join(__dirname, 'server'),
+    },
+    timeout: 600_000,
+  });
+
+  const baseName = files[0].originalname.replace(/\.pdf$/i, '') || 'document';
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="BOOKMARKED_${baseName}.pdf"`);
+
+  proc.stdout.pipe(res);
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (d: Buffer) => {
+    const line = d.toString().trim();
+    if (line) console.log(`[bookmarks/apply] ${line}`);
+    stderrBuf += line + '\n';
+  });
+
+  proc.on('close', (code: number | null) => {
+    cleanup();
+    if (code !== 0 && !res.writableEnded) {
+      console.error(`[bookmarks/apply] python exited ${code}: ${stderrBuf.substring(0, 500)}`);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: stderrBuf || `python exited ${code}` });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  proc.on('error', (err: Error) => {
+    cleanup();
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, error: `Process error: ${err.message}` });
+    } else {
+      res.end();
+    }
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`API server running on http://localhost:${PORT}`);
 });
