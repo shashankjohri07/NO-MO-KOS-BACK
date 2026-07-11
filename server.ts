@@ -8,7 +8,11 @@ import { dirname, join } from 'path';
 import fs from 'fs';
 
 import { makeStore } from './store';
-import { makeRequireAdmin, makeWhoami, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
+import { makeRequireAdmin, makeWhoami, resolveEmail, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
+import {
+  loadBillingConfig, getEntitlement, createOrder, verifySignature,
+  ALL_TOOLS, type BillingPlan,
+} from './billing';
 import { sendEventEmail, emailMode, renderEventEmail, applyEmailConfig, currentSender, type EmailConfig } from './email';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -378,6 +382,214 @@ app.put('/api/admin/email/config', requireAdmin, async (req: AuthedRequest, res:
   } catch (e) {
     console.error(`[admin/email] set: ${e}`);
     res.status(500).json({ ok: false, error: 'Could not save email settings' });
+  }
+});
+
+// ── Billing (Spotify-style subscriptions) ────────────────────────────────
+// Plans/keys are admin-configured in app_config('billing_config'); users buy
+// a period through Razorpay; entitlement is computed lazily so an expired
+// subscription simply stops working — no scheduler.
+
+/** requireUser: any signed-in user (not necessarily an admin). */
+async function requireUser(req: AuthedRequest, res: Response): Promise<string | null> {
+  const email = await resolveEmail(req);
+  if (!email) res.status(401).json({ ok: false, error: 'Please sign in first.' });
+  else req.userEmail = email;
+  return email;
+}
+
+// Public: plans + whether billing is on (no secrets).
+app.get('/api/billing/plans', async (_req: Request, res: Response) => {
+  try {
+    const cfg = await loadBillingConfig(store);
+    res.json({ ok: true, enabled: cfg.enabled, keyId: cfg.keyId, plans: cfg.plans });
+  } catch (e) {
+    console.error(`[billing/plans] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load plans' });
+  }
+});
+
+// The signed-in user's current plan, quota and expiry.
+app.get('/api/billing/me', async (req: AuthedRequest, res: Response) => {
+  const email = await requireUser(req, res);
+  if (!email) return;
+  try {
+    res.json({ ok: true, entitlement: await getEntitlement(store, email) });
+  } catch (e) {
+    console.error(`[billing/me] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load your plan' });
+  }
+});
+
+// Start a purchase: create a Razorpay order for the chosen plan.
+app.post('/api/billing/order', async (req: AuthedRequest, res: Response) => {
+  const email = await requireUser(req, res);
+  if (!email) return;
+  try {
+    const cfg = await loadBillingConfig(store);
+    if (!cfg.enabled) { res.status(400).json({ ok: false, error: 'Billing is not enabled.' }); return; }
+    if (!cfg.keyId || !cfg.keySecret) {
+      res.status(503).json({ ok: false, error: 'Payments are not configured yet — contact the administrator.' });
+      return;
+    }
+    const plan = cfg.plans.find((p) => p.id === String(req.body?.planId || ''));
+    if (!plan || plan.priceInr <= 0) {
+      res.status(400).json({ ok: false, error: 'Unknown or free plan.' });
+      return;
+    }
+    const order = await createOrder(cfg, plan, email);
+    res.json({ ok: true, ...order, keyId: cfg.keyId, plan: { id: plan.id, name: plan.name } });
+  } catch (e) {
+    console.error(`[billing/order] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not start the payment. Try again.' });
+  }
+});
+
+// Checkout success: verify the signature, then activate the subscription.
+app.post('/api/billing/verify', async (req: AuthedRequest, res: Response) => {
+  const email = await requireUser(req, res);
+  if (!email) return;
+  const { planId, orderId, paymentId, signature } = req.body ?? {};
+  if (!planId || !orderId || !paymentId || !signature) {
+    res.status(400).json({ ok: false, error: 'Missing payment details.' });
+    return;
+  }
+  try {
+    const cfg = await loadBillingConfig(store);
+    const plan = cfg.plans.find((p) => p.id === String(planId));
+    if (!plan) { res.status(400).json({ ok: false, error: 'Unknown plan.' }); return; }
+    if (!verifySignature(cfg, String(orderId), String(paymentId), String(signature))) {
+      console.error(`[billing/verify] BAD SIGNATURE for ${email} order=${orderId}`);
+      res.status(400).json({ ok: false, error: 'Payment verification failed. If money was deducted it will be auto-refunded by Razorpay.' });
+      return;
+    }
+    const now = new Date();
+    const sub = await store.createSubscription({
+      email,
+      plan_id: plan.id,
+      status: 'active',
+      started_at: now.toISOString(),
+      expires_at: new Date(now.getTime() + plan.periodDays * 86400_000).toISOString(),
+      razorpay_order_id: String(orderId),
+      razorpay_payment_id: String(paymentId),
+    });
+    console.log(`[billing] ${email} subscribed to ${plan.id} until ${sub.expires_at}`);
+    res.json({ ok: true, entitlement: await getEntitlement(store, email) });
+  } catch (e) {
+    console.error(`[billing/verify] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not activate the subscription — contact support with your payment id.' });
+  }
+});
+
+// One billable document run: checks quota + tool access, records usage.
+// Tools call this right before processing; a 402/403 tells the UI to show
+// the upgrade prompt instead.
+app.post('/api/billing/consume', async (req: AuthedRequest, res: Response) => {
+  const email = await requireUser(req, res);
+  if (!email) return;
+  const tool = String(req.body?.tool ?? '').trim().slice(0, 50);
+  try {
+    const ent = await getEntitlement(store, email);
+    if (!ent.billingEnabled) { res.json({ ok: true, remaining: -1 }); return; }
+    if (tool && !ent.plan.tools.includes(tool)) {
+      res.status(403).json({
+        ok: false, code: 'tool_not_in_plan',
+        error: `The ${tool} tool is not included in your ${ent.plan.name} plan.`,
+      });
+      return;
+    }
+    if (ent.remaining === 0) {
+      res.status(402).json({
+        ok: false, code: 'quota_exhausted',
+        error: `You have used all ${ent.docsLimit} documents in your ${ent.plan.name} plan.`,
+      });
+      return;
+    }
+    await store.trackUsage(email, tool || 'unknown');
+    res.json({ ok: true, remaining: ent.remaining === -1 ? -1 : ent.remaining - 1 });
+  } catch (e) {
+    console.error(`[billing/consume] ${e}`);
+    // Fail-open: a billing hiccup must never block a paying user's filing.
+    res.json({ ok: true, remaining: -1 });
+  }
+});
+
+// Admin: read/write billing config (key secret is write-only, like the
+// email password), list subscriptions.
+app.get('/api/admin/billing/config', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const cfg = await loadBillingConfig(store);
+    res.json({
+      ok: true,
+      config: {
+        enabled: cfg.enabled,
+        keyId: cfg.keyId,
+        hasKeySecret: Boolean(cfg.keySecret),
+        plans: cfg.plans,
+      },
+      allTools: ALL_TOOLS,
+    });
+  } catch (e) {
+    console.error(`[admin/billing] get: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load billing config' });
+  }
+});
+
+app.put('/api/admin/billing/config', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  try {
+    const prev = await loadBillingConfig(store);
+    const enabled = Boolean(req.body?.enabled);
+    const keyId = String(req.body?.keyId ?? '').trim().slice(0, 100);
+    const rawSecret = req.body?.keySecret; // undefined = keep, '' = clear
+    const keySecret =
+      rawSecret === undefined ? prev.keySecret : String(rawSecret).trim().slice(0, 200);
+
+    const rawPlans = req.body?.plans;
+    if (!Array.isArray(rawPlans) || rawPlans.length === 0 || rawPlans.length > 10) {
+      res.status(400).json({ ok: false, error: 'Provide between 1 and 10 plans.' });
+      return;
+    }
+    const plans: BillingPlan[] = [];
+    const seen = new Set<string>();
+    for (const p of rawPlans) {
+      const id = String(p?.id ?? '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 30);
+      const name = String(p?.name ?? '').trim().slice(0, 40);
+      const priceInr = Math.max(0, Math.floor(Number(p?.priceInr) || 0));
+      const periodDays = Math.min(3660, Math.max(1, Math.floor(Number(p?.periodDays) || 30)));
+      const docsRaw = Math.floor(Number(p?.docsPerPeriod));
+      const docsPerPeriod = Number.isFinite(docsRaw) && docsRaw >= -1 ? docsRaw : 0;
+      const tools = Array.isArray(p?.tools)
+        ? p.tools.map((t: unknown) => String(t)).filter((t: string) => ALL_TOOLS.includes(t))
+        : [];
+      if (!id || !name || seen.has(id)) {
+        res.status(400).json({ ok: false, error: `Every plan needs a unique id and a name (problem near "${name || id}").` });
+        return;
+      }
+      seen.add(id);
+      plans.push({
+        id, name,
+        description: String(p?.description ?? '').trim().slice(0, 200),
+        priceInr, periodDays, docsPerPeriod, tools,
+      });
+    }
+    if (!plans.some((p) => p.priceInr === 0)) {
+      res.status(400).json({ ok: false, error: 'Keep at least one free (₹0) plan — it is what new users start on.' });
+      return;
+    }
+    await store.setConfig('billing_config', { enabled, keyId, keySecret, plans });
+    console.log(`[admin/billing] updated by ${req.userEmail}: enabled=${enabled} plans=${plans.map((p) => p.id).join(',')}`);
+    res.json({ ok: true, config: { enabled, keyId, hasKeySecret: Boolean(keySecret), plans } });
+  } catch (e) {
+    console.error(`[admin/billing] set: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not save billing config' });
+  }
+});
+
+app.get('/api/admin/billing/subscriptions', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    res.json({ ok: true, subscriptions: await store.listSubscriptions() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'Could not load subscriptions' });
   }
 });
 
