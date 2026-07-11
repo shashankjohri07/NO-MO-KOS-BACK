@@ -14,6 +14,7 @@ import {
   ALL_TOOLS, type BillingPlan,
 } from './billing';
 import { sendEventEmail, emailMode, renderEventEmail, applyEmailConfig, currentSender, type EmailConfig } from './email';
+import { removeBackground } from './removebg';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -382,6 +383,40 @@ app.put('/api/admin/email/config', requireAdmin, async (req: AuthedRequest, res:
   } catch (e) {
     console.error(`[admin/email] set: ${e}`);
     res.status(500).json({ ok: false, error: 'Could not save email settings' });
+  }
+});
+
+// ── remove.bg (signature background removal) ─────────────────────────────
+// Key is write-only via the admin dashboard; env REMOVEBG_API_KEY also works.
+
+app.get('/api/admin/removebg', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const cfg = ((await store.getConfig('removebg_config')) ?? {}) as { apiKey?: string };
+    res.json({
+      ok: true,
+      hasKey: Boolean((cfg.apiKey || '').trim() || (process.env.REMOVEBG_API_KEY || '').trim()),
+    });
+  } catch (e) {
+    console.error(`[admin/removebg] get: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load remove.bg settings' });
+  }
+});
+
+app.put('/api/admin/removebg', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  // '' clears the saved key (env fallback still applies); string replaces it.
+  const apiKey = String(req.body?.apiKey ?? '').trim().slice(0, 100);
+  try {
+    await store.setConfig('removebg_config', { apiKey });
+    const { resetRemoveBgKeyCache } = await import('./removebg');
+    resetRemoveBgKeyCache();
+    console.log(`[admin/removebg] updated by ${req.userEmail}: key=${apiKey ? 'set' : 'cleared'}`);
+    res.json({
+      ok: true,
+      hasKey: Boolean(apiKey || (process.env.REMOVEBG_API_KEY || '').trim()),
+    });
+  } catch (e) {
+    console.error(`[admin/removebg] set: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not save remove.bg settings' });
   }
 });
 
@@ -851,7 +886,7 @@ const uploadDualFields = upload.fields([
 // itself. Render's `client_max_body_size` and the multer `limits.fileSize`
 // gate the upload size; Python timing is bounded by the 10-minute spawn
 // timeout below.
-app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response) => {
+app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Response) => {
   const fileMap = (req.files as Record<string, Express.Multer.File[]> | undefined) ?? {};
   const mainFiles = fileMap.document ?? [];
   const annexFiles = fileMap.annex ?? [];
@@ -866,14 +901,24 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
 
   const mainPaths = mainFiles.map((f) => f.path);
   const annexPaths = annexFiles.map((f) => f.path);
+
+  // Strip signature backgrounds via remove.bg (fail-open: original path on
+  // any error; Python's chroma-key fallback still applies downstream).
+  const clientSigPath = clientSig ? await removeBackground(store, clientSig.path) : undefined;
+  const advocateSigPath = advocateSig ? await removeBackground(store, advocateSig.path) : undefined;
+  const specialClientSigPath = specialClientSig
+    ? await removeBackground(store, specialClientSig.path) : undefined;
+  const specialAdvocateSigPath = specialAdvocateSig
+    ? await removeBackground(store, specialAdvocateSig.path) : undefined;
+
   const sigPaths = [
-    clientSig?.path,
-    advocateSig?.path,
-    specialClientSig?.path,
-    specialAdvocateSig?.path,
-  ].filter(Boolean) as string[];
+    clientSig?.path, clientSigPath,
+    advocateSig?.path, advocateSigPath,
+    specialClientSig?.path, specialClientSigPath,
+    specialAdvocateSig?.path, specialAdvocateSigPath,
+  ].filter((p): p is string => !!p);
   const cleanup = () => {
-    for (const p of [...mainPaths, ...annexPaths, ...sigPaths]) fs.unlink(p, () => {});
+    for (const p of new Set([...mainPaths, ...annexPaths, ...sigPaths])) fs.unlink(p, () => {});
   };
 
   const rawIndexEnd = (req.body?.indexEndPage ?? '0') as string;
@@ -915,10 +960,10 @@ app.post('/api/write-pagination', uploadDualFields, (req: Request, res: Response
   const args = [join(__dirname, 'server', 'error_detector.py')];
   for (const p of mainPaths) args.push('--file', p);
   for (const p of annexPaths) args.push('--annex', p);
-  if (clientSig) args.push('--client-sig', clientSig.path);
-  if (advocateSig) args.push('--advocate-sig', advocateSig.path);
-  if (specialClientSig) args.push('--special-sig-client', specialClientSig.path);
-  if (specialAdvocateSig) args.push('--special-sig-advocate', specialAdvocateSig.path);
+  if (clientSigPath) args.push('--client-sig', clientSigPath);
+  if (advocateSigPath) args.push('--advocate-sig', advocateSigPath);
+  if (specialClientSigPath) args.push('--special-sig-client', specialClientSigPath);
+  if (specialAdvocateSigPath) args.push('--special-sig-advocate', specialAdvocateSigPath);
   args.push('--index-end-page', String(indexEndPage));
   if (signPages) args.push('--sign-pages', signPages);
   args.push('--mode', 'write');
