@@ -62,6 +62,30 @@ create table if not exists app_config (
   key text primary key,
   value jsonb not null
 );
+
+-- Billing: paid subscriptions (one row per purchase; access is decided by
+-- status='active' AND expires_at > now(), so expiry needs no scheduler)
+create table if not exists subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  email text not null,
+  plan_id text not null,
+  status text not null default 'active',
+  started_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  razorpay_order_id text,
+  razorpay_payment_id text,
+  created_at timestamptz not null default now()
+);
+create index if not exists subscriptions_email_idx on subscriptions (email, status, expires_at);
+
+-- Billing: one row per billable document run (quota counting)
+create table if not exists usage_events (
+  id bigint generated always as identity primary key,
+  email text not null,
+  tool text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists usage_events_email_idx on usage_events (email, created_at);
 ```
 
 The backend uses the **service_role** key over PostgREST, which bypasses Row

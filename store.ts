@@ -44,6 +44,18 @@ export interface FeedbackEntry {
   created_at: string;
 }
 
+export interface SubscriptionRecord {
+  id: string;
+  email: string;
+  plan_id: string;
+  status: 'active' | 'cancelled';
+  started_at: string;
+  expires_at: string;
+  razorpay_order_id: string | null;
+  razorpay_payment_id: string | null;
+  created_at: string;
+}
+
 export interface Store {
   addSubscriber(email: string): Promise<void>;
   listSubscribers(): Promise<Subscriber[]>;
@@ -64,6 +76,18 @@ export interface Store {
   // Generic JSON key-value config (product tags, feature flags, …).
   getConfig(key: string): Promise<unknown | null>;
   setConfig(key: string, value: unknown): Promise<void>;
+  // Billing: paid subscriptions + per-user document usage.
+  createSubscription(
+    s: Omit<SubscriptionRecord, 'id' | 'created_at'>,
+  ): Promise<SubscriptionRecord>;
+  /** Latest non-expired active subscription for the user, or null. */
+  getActiveSubscription(email: string): Promise<SubscriptionRecord | null>;
+  cancelSubscription(email: string): Promise<void>;
+  listSubscriptions(): Promise<SubscriptionRecord[]>;
+  /** Record one billable document run for the user. */
+  trackUsage(email: string, tool: string): Promise<void>;
+  /** How many document runs the user has made since the given ISO time. */
+  countUsageSince(email: string, sinceIso: string): Promise<number>;
   kind: string;
 }
 
@@ -221,6 +245,65 @@ class SupabaseStore implements Store {
       body: JSON.stringify({ key, value }),
     });
   }
+
+  // Tables: subscriptions + usage_events — see README-ADMIN.md for the SQL.
+  async createSubscription(
+    s: Omit<SubscriptionRecord, 'id' | 'created_at'>,
+  ): Promise<SubscriptionRecord> {
+    const rows = await this.req('subscriptions', { method: 'POST', body: JSON.stringify(s) });
+    return rows[0];
+  }
+
+  async getActiveSubscription(email: string): Promise<SubscriptionRecord | null> {
+    const rows = await this.req(
+      `subscriptions?email=eq.${encodeURIComponent(email)}&status=eq.active` +
+        `&expires_at=gt.${encodeURIComponent(new Date().toISOString())}` +
+        `&order=expires_at.desc&limit=1`,
+    );
+    return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+  }
+
+  async cancelSubscription(email: string): Promise<void> {
+    await this.req(
+      `subscriptions?email=eq.${encodeURIComponent(email)}&status=eq.active`,
+      { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) },
+    );
+  }
+
+  async listSubscriptions(): Promise<SubscriptionRecord[]> {
+    try {
+      return (await this.req('subscriptions?select=*&order=created_at.desc&limit=500')) ?? [];
+    } catch (e) {
+      console.warn(`[store] listSubscriptions failed (table may not exist yet): ${e}`);
+      return [];
+    }
+  }
+
+  async trackUsage(email: string, tool: string): Promise<void> {
+    await this.req('usage_events', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ email, tool }),
+    });
+  }
+
+  async countUsageSince(email: string, sinceIso: string): Promise<number> {
+    const r = await fetch(
+      `${this.url}/rest/v1/usage_events?email=eq.${encodeURIComponent(email)}` +
+        `&created_at=gte.${encodeURIComponent(sinceIso)}&select=id`,
+      {
+        headers: {
+          apikey: this.key,
+          Authorization: `Bearer ${this.key}`,
+          Prefer: 'count=exact',
+          Range: '0-0',
+        },
+      },
+    );
+    // Content-Range: "0-0/NNN" — the total after the slash is the count.
+    const total = (r.headers.get('content-range') || '').split('/')[1];
+    return total && total !== '*' ? parseInt(total, 10) : 0;
+  }
 }
 
 // ── JSON-file fallback (dev / unconfigured) ────────────────────────────────
@@ -232,6 +315,8 @@ interface FileShape {
   tool_events: { tool: string; created_at: string }[];
   feedback: FeedbackEntry[];
   app_config: Record<string, unknown>;
+  subscriptions: SubscriptionRecord[];
+  usage_events: { email: string; tool: string; created_at: string }[];
 }
 
 class FileStore implements Store {
@@ -244,9 +329,14 @@ class FileStore implements Store {
       d.tool_events ??= [];
       d.feedback ??= [];
       d.app_config ??= {};
+      d.subscriptions ??= [];
+      d.usage_events ??= [];
       return d;
     } catch {
-      return { subscribers: [], events: [], admin_roles: [], tool_events: [], feedback: [], app_config: {} };
+      return {
+        subscribers: [], events: [], admin_roles: [], tool_events: [],
+        feedback: [], app_config: {}, subscriptions: [], usage_events: [],
+      };
     }
   }
 
@@ -373,6 +463,52 @@ class FileStore implements Store {
     const d = this.read();
     d.app_config[key] = value;
     this.write(d);
+  }
+
+  async createSubscription(
+    s: Omit<SubscriptionRecord, 'id' | 'created_at'>,
+  ): Promise<SubscriptionRecord> {
+    const d = this.read();
+    const rec: SubscriptionRecord = {
+      ...s,
+      id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      created_at: new Date().toISOString(),
+    };
+    d.subscriptions.unshift(rec);
+    this.write(d);
+    return rec;
+  }
+
+  async getActiveSubscription(email: string): Promise<SubscriptionRecord | null> {
+    const now = new Date().toISOString();
+    return (
+      this.read().subscriptions.find(
+        (s) => s.email === email && s.status === 'active' && s.expires_at > now,
+      ) ?? null
+    );
+  }
+
+  async cancelSubscription(email: string): Promise<void> {
+    const d = this.read();
+    for (const s of d.subscriptions) {
+      if (s.email === email && s.status === 'active') s.status = 'cancelled';
+    }
+    this.write(d);
+  }
+
+  async listSubscriptions(): Promise<SubscriptionRecord[]> {
+    return this.read().subscriptions;
+  }
+
+  async trackUsage(email: string, tool: string): Promise<void> {
+    const d = this.read();
+    d.usage_events.push({ email, tool, created_at: new Date().toISOString() });
+    this.write(d);
+  }
+
+  async countUsageSince(email: string, sinceIso: string): Promise<number> {
+    return this.read().usage_events.filter((u) => u.email === email && u.created_at >= sinceIso)
+      .length;
   }
 }
 

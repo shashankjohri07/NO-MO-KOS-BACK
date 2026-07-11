@@ -43,7 +43,7 @@ export interface AuthedRequest extends Request {
 }
 
 /** Resolve the caller's email by forwarding their cookie to /auth/me. */
-async function resolveEmail(req: Request): Promise<string | null> {
+export async function resolveEmail(req: Request): Promise<string | null> {
   const cookie = req.headers.cookie;
   if (!cookie) return null;
   try {
