@@ -15,16 +15,48 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import type { EventRecord } from './store';
 
-const GMAIL_USER = process.env.GMAIL_USER || '';
-const GMAIL_APP_PASSWORD = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, ''); // Google shows it with spaces
+const ENV_GMAIL_USER = process.env.GMAIL_USER || '';
+const ENV_GMAIL_APP_PASSWORD = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, ''); // Google shows it with spaces
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const EMAIL_FROM =
-  process.env.EMAIL_FROM ||
-  (GMAIL_USER ? `Nomikos <${GMAIL_USER}>` : 'Nomikos <onboarding@resend.dev>');
 const RESEND_BATCH = 100;
 
+/**
+ * Admin-editable email settings, saved in the store's app_config under the
+ * key 'email_config' and applied at boot / on every admin save. Env vars are
+ * the fallback when a field is blank, so an unconfigured dashboard keeps
+ * today's behaviour exactly.
+ */
+export interface EmailConfig {
+  gmailUser: string;
+  gmailAppPassword: string;
+  fromName: string;
+}
+
+let _cfg: Partial<EmailConfig> = {};
+
+export function applyEmailConfig(cfg: Partial<EmailConfig> | null): void {
+  _cfg = cfg || {};
+  _tx = null; // credentials may have changed — drop the pooled connection
+}
+
+function effective(): { user: string; pass: string; from: string } {
+  const user = (_cfg.gmailUser || '').trim() || ENV_GMAIL_USER;
+  const pass = (_cfg.gmailAppPassword || '').replace(/\s+/g, '') || ENV_GMAIL_APP_PASSWORD;
+  const name = (_cfg.fromName || '').trim() || 'Nomikos';
+  const from =
+    user ? `${name} <${user}>` : process.env.EMAIL_FROM || `${name} <onboarding@resend.dev>`;
+  return { user, pass, from };
+}
+
+/** Sender address currently in effect (for the admin UI). */
+export function currentSender(): { from: string; user: string } {
+  const { from, user } = effective();
+  return { from, user };
+}
+
 export function emailMode(): 'gmail' | 'resend' | 'dry-run' {
-  if (GMAIL_USER && GMAIL_APP_PASSWORD) return 'gmail';
+  const { user, pass } = effective();
+  if (user && pass) return 'gmail';
   if (RESEND_API_KEY) return 'resend';
   return 'dry-run';
 }
@@ -33,6 +65,7 @@ export function emailMode(): 'gmail' | 'resend' | 'dry-run' {
 let _tx: Transporter | null = null;
 function gmailTransport(): Transporter {
   if (!_tx) {
+    const { user, pass } = effective();
     _tx = nodemailer.createTransport({
       host: 'smtp.gmail.com',
       port: 587,
@@ -40,7 +73,7 @@ function gmailTransport(): Transporter {
       requireTLS: true,   // force STARTTLS — prevents plaintext auth fallback
       pool: true,
       maxConnections: 3,
-      auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+      auth: { user, pass },
       tls: { rejectUnauthorized: true },
     });
   }
@@ -101,7 +134,7 @@ async function sendViaGmail(subject: string, html: string, recipients: string[])
   // transport reuses connections, so this stays fast for modest lists.
   for (const to of recipients) {
     try {
-      await tx.sendMail({ from: EMAIL_FROM, to, subject, html });
+      await tx.sendMail({ from: effective().from, to, subject, html });
       sent++;
     } catch (e: unknown) {
       failed++;
@@ -118,7 +151,7 @@ async function sendViaResend(subject: string, html: string, recipients: string[]
   let failed = 0;
   for (let i = 0; i < recipients.length; i += RESEND_BATCH) {
     const chunk = recipients.slice(i, i + RESEND_BATCH);
-    const payload = chunk.map((to) => ({ from: EMAIL_FROM, to: [to], subject, html }));
+    const payload = chunk.map((to) => ({ from: effective().from, to: [to], subject, html }));
     try {
       const r = await fetch('https://api.resend.com/emails/batch', {
         method: 'POST',
