@@ -54,6 +54,9 @@ export interface Store {
   createEvent(e: Omit<EventRecord, 'id' | 'created_at' | 'sent_at' | 'sent_count'>): Promise<EventRecord>;
   markEventSent(id: string, sentCount: number): Promise<void>;
   listEvents(): Promise<EventRecord[]>;
+  deleteEvent(id: string): Promise<void>;
+  clearEvents(): Promise<void>;
+  clearFeedback(): Promise<void>;
   trackTool(tool: string): Promise<void>;
   getToolStats(): Promise<ToolStat[]>;
   submitFeedback(entry: { email?: string | null; message: string; tool?: string | null }): Promise<void>;
@@ -138,6 +141,19 @@ class SupabaseStore implements Store {
 
   async listEvents(): Promise<EventRecord[]> {
     return (await this.req('events?select=*&order=created_at.desc&limit=100')) ?? [];
+  }
+
+  async deleteEvent(id: string): Promise<void> {
+    await this.req(`events?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+
+  async clearEvents(): Promise<void> {
+    // PostgREST requires a filter on DELETE; "id not null" matches every row.
+    await this.req('events?id=not.is.null', { method: 'DELETE' });
+  }
+
+  async clearFeedback(): Promise<void> {
+    await this.req('feedback?id=not.is.null', { method: 'DELETE' });
   }
 
   async trackTool(tool: string): Promise<void> {
@@ -299,6 +315,24 @@ class FileStore implements Store {
 
   async listEvents(): Promise<EventRecord[]> {
     return this.read().events;
+  }
+
+  async deleteEvent(id: string): Promise<void> {
+    const d = this.read();
+    d.events = d.events.filter((e) => e.id !== id);
+    this.write(d);
+  }
+
+  async clearEvents(): Promise<void> {
+    const d = this.read();
+    d.events = [];
+    this.write(d);
+  }
+
+  async clearFeedback(): Promise<void> {
+    const d = this.read();
+    d.feedback = [];
+    this.write(d);
   }
 
   async trackTool(tool: string): Promise<void> {

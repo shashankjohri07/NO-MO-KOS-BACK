@@ -9,7 +9,7 @@ import fs from 'fs';
 
 import { makeStore } from './store';
 import { makeRequireAdmin, makeWhoami, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
-import { sendEventEmail, emailMode, renderEventEmail } from './email';
+import { sendEventEmail, emailMode, renderEventEmail, applyEmailConfig, currentSender, type EmailConfig } from './email';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -42,7 +42,16 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // event emails go out through Resend (dry-run until RESEND_API_KEY is set).
 const store = makeStore();
 const requireAdmin = makeRequireAdmin(store);
-console.log(`[admin] store=${store.kind}, email=${emailMode()}`);
+
+// Apply the admin-saved email settings on boot (best-effort; env vars remain
+// the fallback for any blank field, so a missing row keeps today's behaviour).
+store
+  .getConfig('email_config')
+  .then((cfg) => {
+    if (cfg && typeof cfg === 'object') applyEmailConfig(cfg as Partial<EmailConfig>);
+    console.log(`[admin] store=${store.kind}, email=${emailMode()}`);
+  })
+  .catch(() => console.log(`[admin] store=${store.kind}, email=${emailMode()}`));
 
 // Called by the frontend after a successful login/signup so the customer
 // list fills itself — no auth-service DB access needed. Idempotent upsert.
@@ -237,6 +246,44 @@ app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Resp
   }
 });
 
+// Delete one past event (does not un-send any email, just removes the record).
+app.delete('/api/admin/events/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const id = String(req.params.id || '').slice(0, 100);
+  if (!id) { res.status(400).json({ ok: false, error: 'event id required' }); return; }
+  try {
+    await store.deleteEvent(id);
+    console.log(`[admin/events] ${req.userEmail} deleted event ${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[admin/events] delete: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not delete event' });
+  }
+});
+
+// Clear the whole event log in one click.
+app.delete('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  try {
+    await store.clearEvents();
+    console.log(`[admin/events] ${req.userEmail} cleared ALL events`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[admin/events] clear: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not clear events' });
+  }
+});
+
+// Clear all user feedback entries.
+app.delete('/api/admin/feedback', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  try {
+    await store.clearFeedback();
+    console.log(`[admin/feedback] ${req.userEmail} cleared ALL feedback`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[admin/feedback] clear: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not clear feedback' });
+  }
+});
+
 // ── Product tag config ──────────────────────────────────────────────────
 // The landing/products page reads its card tags ("Live", "New", …) from
 // here so an admin can change them without a code deploy. Public read;
@@ -277,6 +324,60 @@ app.put('/api/admin/products/config', requireAdmin, async (req: AuthedRequest, r
   } catch (e) {
     console.error(`[products/config] set: ${e}`);
     res.status(500).json({ ok: false, error: 'Could not save product config' });
+  }
+});
+
+// ── Email settings (admin-editable) ─────────────────────────────────────
+// Sender account + display name live in app_config('email_config') so the
+// admin can rotate the Gmail account / app password without a redeploy.
+// The app password is write-only: GET never returns it, only whether one
+// is saved. Blank fields fall back to the GMAIL_USER / GMAIL_APP_PASSWORD
+// env vars.
+app.get('/api/admin/email/config', requireAdmin, async (_req: AuthedRequest, res: Response) => {
+  try {
+    const cfg = ((await store.getConfig('email_config')) ?? {}) as Partial<EmailConfig>;
+    res.json({
+      ok: true,
+      config: {
+        gmailUser: cfg.gmailUser || '',
+        fromName: cfg.fromName || '',
+        hasPassword: Boolean(cfg.gmailAppPassword),
+      },
+      effective: { ...currentSender(), mode: emailMode() },
+    });
+  } catch (e) {
+    console.error(`[admin/email] get: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load email settings' });
+  }
+});
+
+app.put('/api/admin/email/config', requireAdmin, async (req: AuthedRequest, res: Response) => {
+  const gmailUser = String(req.body?.gmailUser ?? '').trim().toLowerCase().slice(0, 200);
+  const fromName = String(req.body?.fromName ?? '').trim().slice(0, 100);
+  // undefined = keep the stored password; '' = clear it; string = replace it.
+  const rawPass = req.body?.gmailAppPassword;
+  if (gmailUser && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(gmailUser)) {
+    res.status(400).json({ ok: false, error: 'Sender email is not a valid address.' });
+    return;
+  }
+  try {
+    const prev = ((await store.getConfig('email_config')) ?? {}) as Partial<EmailConfig>;
+    const gmailAppPassword =
+      rawPass === undefined
+        ? prev.gmailAppPassword || ''
+        : String(rawPass).replace(/\s+/g, '').slice(0, 100);
+    const cfg: EmailConfig = { gmailUser, fromName, gmailAppPassword };
+    await store.setConfig('email_config', cfg);
+    applyEmailConfig(cfg);
+    console.log(`[admin/email] updated by ${req.userEmail}: user=${gmailUser || '(env)'} name=${fromName || '(default)'} pass=${gmailAppPassword ? 'set' : '(env)'}`);
+    res.json({
+      ok: true,
+      config: { gmailUser, fromName, hasPassword: Boolean(gmailAppPassword) },
+      effective: { ...currentSender(), mode: emailMode() },
+    });
+  } catch (e) {
+    console.error(`[admin/email] set: ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not save email settings' });
   }
 });
 
