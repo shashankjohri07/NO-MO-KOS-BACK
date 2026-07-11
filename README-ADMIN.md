@@ -86,6 +86,14 @@ create table if not exists usage_events (
   created_at timestamptz not null default now()
 );
 create index if not exists usage_events_email_idx on usage_events (email, created_at);
+
+-- User profile: display name + small avatar (data-URL), set after first login
+create table if not exists profiles (
+  email text primary key,
+  username text not null,
+  avatar text,
+  updated_at timestamptz not null default now()
+);
 ```
 
 The backend uses the **service_role** key over PostgREST, which bypasses Row

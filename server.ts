@@ -398,6 +398,47 @@ async function requireUser(req: AuthedRequest, res: Response): Promise<string | 
   return email;
 }
 
+// ── User profile (display name + avatar) ─────────────────────────────────
+// Captured once after first login; avatar is a small client-resized data URL.
+
+app.get('/api/profile', async (req: AuthedRequest, res: Response) => {
+  const email = await requireUser(req, res);
+  if (!email) return;
+  try {
+    const profile = await store.getProfile(email);
+    res.json({ ok: true, profile });
+  } catch (e) {
+    console.error(`[profile] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not load your profile' });
+  }
+});
+
+app.put('/api/profile', async (req: AuthedRequest, res: Response) => {
+  const email = await requireUser(req, res);
+  if (!email) return;
+  const { username, avatar } = req.body ?? {};
+  const name = typeof username === 'string' ? username.trim() : '';
+  if (!name || name.length > 50) {
+    res.status(400).json({ ok: false, error: 'Username must be 1–50 characters.' });
+    return;
+  }
+  let pic: string | null = null;
+  if (typeof avatar === 'string' && avatar) {
+    if (!avatar.startsWith('data:image/') || avatar.length > 300_000) {
+      res.status(400).json({ ok: false, error: 'Profile picture must be a small image.' });
+      return;
+    }
+    pic = avatar;
+  }
+  try {
+    const profile = await store.saveProfile({ email, username: name, avatar: pic });
+    res.json({ ok: true, profile });
+  } catch (e) {
+    console.error(`[profile:save] ${e}`);
+    res.status(500).json({ ok: false, error: 'Could not save your profile' });
+  }
+});
+
 // Public: plans + whether billing is on (no secrets).
 app.get('/api/billing/plans', async (_req: Request, res: Response) => {
   try {

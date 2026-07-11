@@ -56,6 +56,14 @@ export interface SubscriptionRecord {
   created_at: string;
 }
 
+export interface ProfileRecord {
+  email: string;
+  username: string;
+  /** Small data-URL image (client resizes before upload) or null. */
+  avatar: string | null;
+  updated_at: string;
+}
+
 export interface Store {
   addSubscriber(email: string): Promise<void>;
   listSubscribers(): Promise<Subscriber[]>;
@@ -88,6 +96,9 @@ export interface Store {
   trackUsage(email: string, tool: string): Promise<void>;
   /** How many document runs the user has made since the given ISO time. */
   countUsageSince(email: string, sinceIso: string): Promise<number>;
+  // User profile (display name + avatar), set once after first login.
+  getProfile(email: string): Promise<ProfileRecord | null>;
+  saveProfile(p: Omit<ProfileRecord, 'updated_at'>): Promise<ProfileRecord>;
   kind: string;
 }
 
@@ -304,6 +315,27 @@ class SupabaseStore implements Store {
     const total = (r.headers.get('content-range') || '').split('/')[1];
     return total && total !== '*' ? parseInt(total, 10) : 0;
   }
+
+  // Table: profiles(email text PK, username text, avatar text, updated_at) —
+  // see README-ADMIN.md for the SQL.
+  async getProfile(email: string): Promise<ProfileRecord | null> {
+    try {
+      const rows = await this.req(`profiles?email=eq.${encodeURIComponent(email)}&limit=1`);
+      return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+    } catch (e) {
+      console.warn(`[store] getProfile failed (table may not exist yet): ${e}`);
+      return null;
+    }
+  }
+
+  async saveProfile(p: Omit<ProfileRecord, 'updated_at'>): Promise<ProfileRecord> {
+    const rows = await this.req('profiles?on_conflict=email', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+      body: JSON.stringify({ ...p, updated_at: new Date().toISOString() }),
+    });
+    return rows[0];
+  }
 }
 
 // ── JSON-file fallback (dev / unconfigured) ────────────────────────────────
@@ -317,6 +349,7 @@ interface FileShape {
   app_config: Record<string, unknown>;
   subscriptions: SubscriptionRecord[];
   usage_events: { email: string; tool: string; created_at: string }[];
+  profiles: ProfileRecord[];
 }
 
 class FileStore implements Store {
@@ -331,11 +364,13 @@ class FileStore implements Store {
       d.app_config ??= {};
       d.subscriptions ??= [];
       d.usage_events ??= [];
+      d.profiles ??= [];
       return d;
     } catch {
       return {
         subscribers: [], events: [], admin_roles: [], tool_events: [],
         feedback: [], app_config: {}, subscriptions: [], usage_events: [],
+        profiles: [],
       };
     }
   }
@@ -509,6 +544,20 @@ class FileStore implements Store {
   async countUsageSince(email: string, sinceIso: string): Promise<number> {
     return this.read().usage_events.filter((u) => u.email === email && u.created_at >= sinceIso)
       .length;
+  }
+
+  async getProfile(email: string): Promise<ProfileRecord | null> {
+    return this.read().profiles.find((p) => p.email === email) ?? null;
+  }
+
+  async saveProfile(p: Omit<ProfileRecord, 'updated_at'>): Promise<ProfileRecord> {
+    const d = this.read();
+    const rec: ProfileRecord = { ...p, updated_at: new Date().toISOString() };
+    const i = d.profiles.findIndex((x) => x.email === p.email);
+    if (i >= 0) d.profiles[i] = rec;
+    else d.profiles.push(rec);
+    this.write(d);
+    return rec;
   }
 }
 
