@@ -18,14 +18,11 @@ rotate=page.rotation so the stamped image appears upright at the
 visible footer.
 
 Dense-page handling: court convention requires the signature to appear
-on every page, even when text reaches close to the bottom — but it must
-never cover that content. Placement is decided from the page's ACTUAL
-rendered pixels (so text, images, scans and vector graphics are all
-detected): a normal page signs at the bottom footer; a dense page with
-a clear top margin signs in the top header area; and if both ends are
-busy (e.g. full-page scans) the content is scaled up into the area
-above a reserved bottom strip (page size unchanged; survives insert_pdf;
-normalises /Rotate).
+in the footer on every page, even when text reaches close to the bottom.
+If the footer zone has content, the page is scaled up to reserve a clean
+bottom strip for the signature (page size unchanged; survives insert_pdf;
+normalises /Rotate). Signatures are ALWAYS placed in the footer — never
+in the header.
 
 Transparency: the signature's white/near-white background is dropped to
 transparent (chroma-key) before stamping, and no opaque backing card is
@@ -283,14 +280,10 @@ def stamp_signatures_on_page(
     natural ratio so square stamps land at 100×100 and wide cursive sigs
     fill 180×60.
 
-    Overlap protection (signatures must NEVER cover content): placement is
-    decided from the ACTUAL rendered pixels, so it is content-agnostic — body
-    text, embedded images, full-page scans and vector graphics are all caught.
-      * Normal page (footer blank)            -> sign at the BOTTOM footer.
-      * Dense page with a clear top margin     -> sign in the TOP header area.
-      * Both ends busy (e.g. full-page scans)  -> reserve a clean bottom strip
-        by scaling the content up (page size unchanged; survives insert_pdf;
-        normalises /Rotate).
+    Signatures are ALWAYS placed in the footer:
+      * Normal page (footer blank)            -> sign at the bottom.
+      * Dense page (footer has content)        -> scale content up to reserve
+        a clean bottom strip, then sign there.
 
     Works on rotated pages: positions are computed in the visible
     (rotation-aware) coord system and projected to mediabox before
@@ -310,7 +303,6 @@ def stamp_signatures_on_page(
     RIGHT_MARGIN = 60
     STRIP_H = 92.0      # footer / scan band height to test for content
     band_h = 60.0       # signature bounding-box height
-    TOP_HEADER = 48.0   # below the page-number / annexure-label band
 
     # Use rotation-aware (visible) page dims everywhere.
     page_w = page.rect.width
@@ -323,27 +315,15 @@ def stamp_signatures_on_page(
     #   * Dense page, top header is clear    -> sign at the TOP (header area).
     #   * Both ends occupied (rare)          -> reserve a clean bottom strip by
     #                                           scaling the content up.
-    TOP_BAND_H = 42.0   # signature is a bit smaller at the top (tighter margin)
     if _zone_is_blank(page, page_h - STRIP_H, page_h):
-        # Normal page — bottom footer, as before.
         band_top = page_h - 14.0 - band_h
-    elif _zone_is_blank(page, TOP_HEADER, TOP_HEADER + TOP_BAND_H + 6):
-        # Dense page — put the signature in the clear top header area.
-        band_h = TOP_BAND_H
-        band_top = TOP_HEADER
-        print("  dense page; signing in the top header area", file=sys.stderr)
     else:
-        # Both ends busy — scale the content up and reserve a clean strip.
+        # Footer has content — scale it up to make room for signatures.
         try:
             page = _reserve_footer_strip(page, STRIP_H)
             page_w = page.rect.width
             page_h = page.rect.height
-            rotation = page.rotation  # rebuilt page is upright
-            print(
-                f"  dense page (top also full); scaled content and reserved a "
-                f"{STRIP_H:.0f}pt bottom strip",
-                file=sys.stderr,
-            )
+            rotation = page.rotation
         except Exception as e:
             print(f"  strip reserve failed ({e}); stamping at the bottom", file=sys.stderr)
         band_top = page_h - 14.0 - band_h
