@@ -101,6 +101,7 @@ def append_annexures_to_doc(
     annexure_paths: List[str],
     client_sig_path: Optional[str] = None,
     advocate_sig_path: Optional[str] = None,
+    client2_sig_path: Optional[str] = None,
 ) -> bool:
     """Append each annexure file to the OPEN document `doc`, stamping the
     "Annexure A-N" label on each annexure's first page and (optionally) the
@@ -129,9 +130,10 @@ def append_annexures_to_doc(
                 stamp_annexure_label(annex[0], label)
 
                 # Footer signatures on every page of this annexure.
-                if client_sig_path or advocate_sig_path:
+                if client_sig_path or advocate_sig_path or client2_sig_path:
                     sides = []
                     if client_sig_path: sides.append("client")
+                    if client2_sig_path: sides.append("client2")
                     if advocate_sig_path: sides.append("advocate")
                     print(
                         f"  stamping {'+'.join(sides)} sig on {len(annex)} "
@@ -141,6 +143,7 @@ def append_annexures_to_doc(
                     for p_idx in range(len(annex)):
                         stamp_signatures_on_page(
                             annex[p_idx], client_sig_path, advocate_sig_path,
+                            client2_sig_path=client2_sig_path,
                         )
                 else:
                     print(

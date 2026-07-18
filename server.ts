@@ -868,12 +868,14 @@ const uploadDualFields = upload.fields([
   // Optional PNG/JPG signatures stamped in the footer of every annexure page.
   // Single file each — first matching field wins if duplicates posted.
   { name: 'clientSignature', maxCount: 1 },
+  { name: 'clientSignature2', maxCount: 1 },
   { name: 'advocateSignature', maxCount: 1 },
   // Optional PNG/JPG signatures for the SPECIAL main-document pages listed in
   // signPages. Separate images from the annexure signatures above — these let
   // the user sign the vakalatnama / prayer page / affidavit with a distinct
   // signature set, independent of the every-annexure-page stamps.
   { name: 'specialSignatureClient', maxCount: 1 },
+  { name: 'specialSignatureClient2', maxCount: 1 },
   { name: 'specialSignatureAdvocate', maxCount: 1 },
 ]);
 
@@ -891,8 +893,10 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
   const mainFiles = fileMap.document ?? [];
   const annexFiles = fileMap.annex ?? [];
   const clientSig = fileMap.clientSignature?.[0];
+  const clientSig2 = fileMap.clientSignature2?.[0];
   const advocateSig = fileMap.advocateSignature?.[0];
   const specialClientSig = fileMap.specialSignatureClient?.[0];
+  const specialClientSig2 = fileMap.specialSignatureClient2?.[0];
   const specialAdvocateSig = fileMap.specialSignatureAdvocate?.[0];
   if (mainFiles.length === 0) {
     res.status(400).json({ ok: false, error: 'No file uploaded' });
@@ -905,16 +909,21 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
   // Strip signature backgrounds via remove.bg (fail-open: original path on
   // any error; Python's chroma-key fallback still applies downstream).
   const clientSigPath = clientSig ? await removeBackground(store, clientSig.path) : undefined;
+  const clientSig2Path = clientSig2 ? await removeBackground(store, clientSig2.path) : undefined;
   const advocateSigPath = advocateSig ? await removeBackground(store, advocateSig.path) : undefined;
   const specialClientSigPath = specialClientSig
     ? await removeBackground(store, specialClientSig.path) : undefined;
+  const specialClientSig2Path = specialClientSig2
+    ? await removeBackground(store, specialClientSig2.path) : undefined;
   const specialAdvocateSigPath = specialAdvocateSig
     ? await removeBackground(store, specialAdvocateSig.path) : undefined;
 
   const sigPaths = [
     clientSig?.path, clientSigPath,
+    clientSig2?.path, clientSig2Path,
     advocateSig?.path, advocateSigPath,
     specialClientSig?.path, specialClientSigPath,
+    specialClientSig2?.path, specialClientSig2Path,
     specialAdvocateSig?.path, specialAdvocateSigPath,
   ].filter((p): p is string => !!p);
   const cleanup = () => {
@@ -938,8 +947,10 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
   const annexSummary = annexFiles.length ? ` + ${annexFiles.length} annex` : '';
   const sigSummary = [
     clientSig ? 'client-sig' : null,
+    clientSig2 ? 'client2-sig' : null,
     advocateSig ? 'advocate-sig' : null,
     specialClientSig ? 'special-client-sig' : null,
+    specialClientSig2 ? 'special-client2-sig' : null,
     specialAdvocateSig ? 'special-advocate-sig' : null,
   ]
     .filter(Boolean)
@@ -949,8 +960,10 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
       ...mainFiles,
       ...annexFiles,
       ...(clientSig ? [clientSig] : []),
+      ...(clientSig2 ? [clientSig2] : []),
       ...(advocateSig ? [advocateSig] : []),
       ...(specialClientSig ? [specialClientSig] : []),
+      ...(specialClientSig2 ? [specialClientSig2] : []),
       ...(specialAdvocateSig ? [specialAdvocateSig] : []),
     ].reduce((acc, f) => acc + f.size, 0) / 1024 / 1024;
   console.log(
@@ -961,8 +974,10 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
   for (const p of mainPaths) args.push('--file', p);
   for (const p of annexPaths) args.push('--annex', p);
   if (clientSigPath) args.push('--client-sig', clientSigPath);
+  if (clientSig2Path) args.push('--client2-sig', clientSig2Path);
   if (advocateSigPath) args.push('--advocate-sig', advocateSigPath);
   if (specialClientSigPath) args.push('--special-sig-client', specialClientSigPath);
+  if (specialClientSig2Path) args.push('--special-sig-client2', specialClientSig2Path);
   if (specialAdvocateSigPath) args.push('--special-sig-advocate', specialAdvocateSigPath);
   args.push('--index-end-page', String(indexEndPage));
   if (signPages) args.push('--sign-pages', signPages);
