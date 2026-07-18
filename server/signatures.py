@@ -272,9 +272,10 @@ def stamp_signatures_on_page(
     page,
     client_sig_path: Optional[str],
     advocate_sig_path: Optional[str],
+    client2_sig_path: Optional[str] = None,
 ) -> None:
-    """Stamp client (left) and advocate (right) signatures in the page footer
-    with native aspect ratio preserved.
+    """Stamp client (left), optional second client (centre) and advocate
+    (right) signatures in the page footer with native aspect ratio preserved.
 
     Bounding box per side: 180×100pt. Real rect is sized to the image's
     natural ratio so square stamps land at 100×100 and wide cursive sigs
@@ -291,7 +292,7 @@ def stamp_signatures_on_page(
     """
     if not fitz:
         return
-    if not client_sig_path and not advocate_sig_path:
+    if not client_sig_path and not advocate_sig_path and not client2_sig_path:
         return
 
     # Sized for legal filings — visible but never dominant. Court convention
@@ -352,6 +353,34 @@ def stamp_signatures_on_page(
                         f"(rotation={rotation}, rect={mediabox_rect}): {e}",
                         file=sys.stderr,
                     )
+
+    # Second client (centre) — for filings with two client parties. Centred
+    # horizontally so it never collides with the left/right stamps.
+    if client2_sig_path:
+        if not os.path.exists(client2_sig_path):
+            print(
+                f"  client-2 sig file missing on disk: {client2_sig_path}",
+                file=sys.stderr,
+            )
+        else:
+            render_path = _transparent_signature(client2_sig_path)
+            aspect = _read_image_aspect(render_path) or 1.0
+            h = band_h
+            w = h * aspect
+            if w > SIG_MAX_W:
+                w = SIG_MAX_W
+                h = w / aspect
+            centre_x = (page_w - w) / 2
+            visible_rect = fitz.Rect(centre_x, band_top, centre_x + w, band_top + h)
+            mediabox_rect = _project_to_mediabox(page, visible_rect)
+            try:
+                _insert_sig_image(page, mediabox_rect, render_path, rotation)
+            except Exception as e:
+                print(
+                    f"  client-2 sig insert failed "
+                    f"(rotation={rotation}, rect={mediabox_rect}): {e}",
+                    file=sys.stderr,
+                )
 
     # Advocate (right). Right-edge anchored — compute width first in
     # visible coords, then project to mediabox.

@@ -26,6 +26,7 @@ def paginate_doc(
     extra_sig_pages: Optional[Set[int]] = None,
     client_sig_path: Optional[str] = None,
     advocate_sig_path: Optional[str] = None,
+    client2_sig_path: Optional[str] = None,
 ) -> bool:
     """Redact + stamp page numbers (and optional extra signatures) on the
     OPEN document `doc`. Core of write_pagination, split out so the streaming
@@ -100,7 +101,7 @@ def paginate_doc(
         # user-specified pages. These are extra to whatever annexures got
         # in append_annexures_to_pdf — they cover the "I want signatures
         # on the prayer page / vakalatnama too" use case.
-        if extra_sig_pages and (client_sig_path or advocate_sig_path):
+        if extra_sig_pages and (client_sig_path or advocate_sig_path or client2_sig_path):
             for i in sorted(extra_sig_pages):
                 if i < 0 or i >= total:
                     print(
@@ -112,6 +113,7 @@ def paginate_doc(
                 try:
                     stamp_signatures_on_page(
                         doc[i], client_sig_path, advocate_sig_path,
+                        client2_sig_path=client2_sig_path,
                     )
                 except Exception as e:
                     print(
@@ -133,6 +135,7 @@ def write_pagination(
     extra_sig_pages: Optional[Set[int]] = None,
     client_sig_path: Optional[str] = None,
     advocate_sig_path: Optional[str] = None,
+    client2_sig_path: Optional[str] = None,
 ) -> bool:
     """Stamp sequential page numbers in the top-right corner of every page
     after the user-supplied index range.
@@ -166,6 +169,7 @@ def write_pagination(
             extra_sig_pages=extra_sig_pages,
             client_sig_path=client_sig_path,
             advocate_sig_path=advocate_sig_path,
+            client2_sig_path=client2_sig_path,
         ):
             return False
         doc.save(output_path, garbage=3, deflate=True)

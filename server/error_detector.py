@@ -270,6 +270,14 @@ def main():
                         help="Path to a PNG/JPG of the advocate's signature. Stamped in the "
                              "bottom-RIGHT footer of every page of every annexure (same overlap "
                              "rules as --client-sig).")
+    parser.add_argument("--client2-sig", default=None,
+                        help="Path to a PNG/JPG of a SECOND client's signature/stamp — for "
+                             "filings with two client parties. Stamped bottom-CENTRE of every "
+                             "annexure page (same rules as --client-sig).")
+    parser.add_argument("--special-sig-client2", default=None,
+                        help="Path to a PNG/JPG second-client signature for the SPECIAL "
+                             "main-document pages listed in --sign-pages (stamped bottom-"
+                             "CENTRE). Falls back to --client2-sig when omitted.")
     parser.add_argument("--index-end-page", type=int, default=0,
                         help="1-indexed last page of the index. Pages 1..N are skipped from "
                              "the pagination check (0 = no skip).")
@@ -310,12 +318,12 @@ def main():
     if args.annex and args.mode != "write":
         parser.error("--annex currently only works with --mode write")
 
-    if (args.client_sig or args.advocate_sig) and not args.annex and not args.sign_pages:
+    if (args.client_sig or args.advocate_sig or args.client2_sig) and not args.annex and not args.sign_pages:
         parser.error("--client-sig / --advocate-sig require at least one --annex "
                      "(auto-sign every annex page) or --sign-pages (sign listed main "
                      "pages). Pass one or the other.")
 
-    if (args.special_sig_client or args.special_sig_advocate) and not args.sign_pages:
+    if (args.special_sig_client or args.special_sig_advocate or args.special_sig_client2) and not args.sign_pages:
         parser.error("--special-sig-client / --special-sig-advocate require --sign-pages "
                      "(they only apply to the listed main pages).")
 
@@ -323,8 +331,8 @@ def main():
     # signatures; fall back to the annexure signatures for backward compat
     # with callers that pass a single shared signature set.
     if args.sign_pages and not (
-        args.special_sig_client or args.special_sig_advocate
-        or args.client_sig or args.advocate_sig
+        args.special_sig_client or args.special_sig_advocate or args.special_sig_client2
+        or args.client_sig or args.advocate_sig or args.client2_sig
     ):
         parser.error("--sign-pages requires a signature image: "
                      "--special-sig-client/--special-sig-advocate (preferred) "
@@ -379,13 +387,15 @@ def main():
                         doc, args.annex,
                         client_sig_path=args.client_sig,
                         advocate_sig_path=args.advocate_sig,
+                        client2_sig_path=args.client2_sig,
                     ):
                         print(json.dumps({"ok": False, "error": "Failed to append annexures"}))
                         return
                     sig_note = ""
-                    if args.client_sig or args.advocate_sig:
+                    if args.client_sig or args.advocate_sig or args.client2_sig:
                         parts = []
                         if args.client_sig: parts.append("client")
+                        if args.client2_sig: parts.append("client2")
                         if args.advocate_sig: parts.append("advocate")
                         sig_note = f" with {'+'.join(parts)} sig"
                     print(
@@ -405,6 +415,7 @@ def main():
                     extra_sig_pages=extra_sig_physical,
                     client_sig_path=args.special_sig_client or args.client_sig,
                     advocate_sig_path=args.special_sig_advocate or args.advocate_sig,
+                    client2_sig_path=args.special_sig_client2 or args.client2_sig,
                 ):
                     print("write_pagination failed", file=sys.stderr)
                     sys.exit(1)
