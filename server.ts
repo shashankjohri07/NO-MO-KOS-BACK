@@ -311,16 +311,21 @@ app.put('/api/admin/products/config', requireAdmin, async (req: AuthedRequest, r
     res.status(400).json({ ok: false, error: 'tags must be an object keyed by product' });
     return;
   }
-  const tags: Record<string, { tag: string; tagVariant: string }> = {};
+  const tags: Record<string, { tag: string; tagVariant: string; order?: number }> = {};
   for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
-    const entry = v as { tag?: unknown; tagVariant?: unknown };
+    const entry = v as { tag?: unknown; tagVariant?: unknown; order?: unknown };
     const tag = String(entry?.tag ?? '').trim().slice(0, 30);
     const tagVariant = String(entry?.tagVariant ?? '').trim();
     if (!tag || !TAG_VARIANTS.has(tagVariant)) {
       res.status(400).json({ ok: false, error: `Invalid tag entry for "${key}"` });
       return;
     }
-    tags[key.slice(0, 50)] = { tag, tagVariant };
+    const out: { tag: string; tagVariant: string; order?: number } = { tag, tagVariant };
+    // `order` positions the card on the products page (1 = first); optional,
+    // stored only when a sane finite number is supplied.
+    const order = Number(entry?.order);
+    if (Number.isFinite(order)) out.order = Math.min(999, Math.max(1, Math.trunc(order)));
+    tags[key.slice(0, 50)] = out;
   }
   try {
     await store.setConfig('product_tags', tags);
