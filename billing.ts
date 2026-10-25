@@ -43,7 +43,6 @@ export const ALL_TOOLS = [
   'annexures',
   'signatures',
   'bookmarks',
-  'index-generator',
 ];
 
 export const DEFAULT_PLANS: BillingPlan[] = [
