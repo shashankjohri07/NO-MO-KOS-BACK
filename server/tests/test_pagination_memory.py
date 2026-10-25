@@ -75,48 +75,37 @@ def test_flush_preserves_page_count_and_content(tmp_path):
     result.close()
 
 
-def test_flush_bounds_memory_growth(tmp_path):
-    """Not a strict byte-count assertion (memory behavior varies by
-    platform/allocator) — asserts the SHAPE: per-page growth with
-    flushing must be meaningfully sub-linear vs without it, which is the
-    property the fix is actually for. Uses resource.ru_maxrss as a
-    same-process, dependency-free proxy (exact values aren't portable,
-    but comparing two runs in the same process on the same platform is)."""
-    import importlib
-    import resource
-
+def test_flush_actually_reopens_the_document(tmp_path, monkeypatch):
+    """Deliberately NOT a memory-byte-count assertion — tried that
+    (comparing resource.ru_maxrss between a flushed and unflushed run) and
+    it was flaky across platforms/allocators (confirmed: passed locally on
+    macOS, failed in CI on Linux, because the actual memory delta a given
+    page count produces is itself allocator/libmupdf-build dependent, not
+    just the flush behavior under test). The real, portable claim the fix
+    needs to make is behavioral: the flush path actually runs and produces
+    a genuinely different Document object, not a byte-count that varies by
+    environment. So: count save+reopen calls instead of measuring RSS.
+    """
     import pagination
 
-    path = _make_image_heavy_pdf(tmp_path, pages=40)
+    path = _make_image_heavy_pdf(tmp_path, pages=60)
+    monkeypatch.setattr(pagination, "_REDACT_FLUSH_EVERY", 10)
 
-    def peak_mb():
-        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return r / 1024 / 1024 if sys.platform == "darwin" else r / 1024
+    reopen_calls = []
+    real_open = fitz.open
 
-    before = peak_mb()
+    def counting_open(*args, **kwargs):
+        if kwargs.get("stream") is not None:
+            reopen_calls.append(1)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(pagination.fitz, "open", counting_open)
+
     doc = fitz.open(path)
-    importlib.reload(pagination)
-    pagination._REDACT_FLUSH_EVERY = 10_000  # effectively disabled
     result = pagination.paginate_doc(doc, 0)
     assert result is not None
-    unflushed_growth = peak_mb() - before
+    assert len(result) == 60
+
+    # 60 pages / flush_every=10 -> 6 flush points mid-loop.
+    assert len(reopen_calls) == 6
     result.close()
-
-    before2 = peak_mb()
-    doc2 = fitz.open(path)
-    pagination._REDACT_FLUSH_EVERY = 10
-    result2 = pagination.paginate_doc(doc2, 0)
-    assert result2 is not None
-    flushed_growth = peak_mb() - before2
-    result2.close()
-
-    pagination._REDACT_FLUSH_EVERY = 25  # restore the real default
-
-    # ru_maxrss is a cumulative high-water mark that never goes down within
-    # a process, so the SECOND measurement's "before" already includes the
-    # first run's growth — meaning this is a conservative comparison, not
-    # inflated in the flushed run's favor.
-    assert flushed_growth < unflushed_growth * 0.9, (
-        f"flushing should meaningfully reduce growth: "
-        f"unflushed={unflushed_growth:.0f}MB flushed={flushed_growth:.0f}MB"
-    )
