@@ -50,7 +50,6 @@ CLI (spawned from Node like bookmarks.py):
 import argparse
 import json
 import sys
-from typing import Dict, List
 
 from config import fitz
 from merge import merge_to_doc
@@ -79,9 +78,9 @@ def _w(text: str, size: float, font: str) -> float:
     return fitz.get_text_length(text, fontname=font, fontsize=size)
 
 
-def _wrap(text: str, size: float, font: str, width: float) -> List[str]:
+def _wrap(text: str, size: float, font: str, width: float) -> list[str]:
     """Greedy word wrap into lines that fit `width`."""
-    lines: List[str] = []
+    lines: list[str] = []
     for para in str(text).split("\n"):
         words = para.split()
         if not words:
@@ -149,7 +148,7 @@ class _Writer:
         self.y += lh
 
 
-def _render_row_lines(row: Dict, text_width: float):
+def _render_row_lines(row: dict, text_width: float):
     """Returns [(text, font)] wrapped lines for a row's particulars cell."""
     out = []
     title = str(row.get("title", "")).strip()
@@ -163,7 +162,7 @@ def _render_row_lines(row: Dict, text_width: float):
     return out or [("", FONT)]
 
 
-def _draw_table(w: _Writer, rows: List[Dict]):
+def _draw_table(w: _Writer, rows: list[dict]):
     """Bordered 3-column index table; continues across pages, repeating the
     header row on each new page."""
     x0 = MARGIN_X - 10
@@ -229,7 +228,7 @@ def _draw_table(w: _Writer, rows: List[Dict]):
     close_segment(seg_top)
 
 
-def build_index(payload: Dict):
+def build_index(payload: dict):
     """Render the index document and return the open fitz doc."""
     w = _Writer()
 
@@ -283,7 +282,7 @@ def build_index(payload: Dict):
     return w.doc
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Filing index generator")
     parser.add_argument("command", choices=("generate",))
     parser.add_argument("--payload", required=True,
@@ -291,13 +290,13 @@ def main():
     parser.add_argument("--file", action="append", default=[],
                         help="Optional document PDF(s); index is prepended "
                              "to the merged result")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if fitz is None:
         print("PyMuPDF is not available", file=sys.stderr)
         sys.exit(1)
 
-    with open(args.payload, "r", encoding="utf-8") as f:
+    with open(args.payload, encoding="utf-8") as f:
         payload = json.load(f)
     if not isinstance(payload, dict) or not payload.get("rows"):
         print("payload must be an object with a non-empty rows array", file=sys.stderr)

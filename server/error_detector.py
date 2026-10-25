@@ -44,14 +44,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from annexures import append_annexures_to_doc, append_annexures_to_pdf  # noqa: E402
+from annotated_pdf import generate_annotated_pdf  # noqa: E402
 from config import fitz  # noqa: E402
 from extraction import extract_pages  # noqa: E402
-from pagination import write_pagination, paginate_doc, check_rule_pagination  # noqa: E402
-from rules import check_rule_doc_upload  # noqa: E402
-from annotated_pdf import generate_annotated_pdf  # noqa: E402
-from annexures import append_annexures_to_pdf, append_annexures_to_doc  # noqa: E402
 from merge import merge_pdfs, merge_to_doc  # noqa: E402
-from page_spec import parse_page_spec, format_page_set, PageSpecError  # noqa: E402
+from page_spec import PageSpecError, format_page_set, parse_page_spec  # noqa: E402
+from pagination import check_rule_pagination, paginate_doc, write_pagination  # noqa: E402
+from rules import check_rule_doc_upload  # noqa: E402
 
 
 def _translate_sign_pages(sign_page_spec: set, main_total: int, index_end_page: int) -> set:
@@ -253,7 +253,11 @@ def _run_full_analysis(file_path: str, index_end_page: int, mode: str, output_di
 # CLI
 # =============================================================================
 
-def main():
+def main(argv=None):
+    """argv=None reads real CLI args (sys.argv[1:], via argparse's own
+    default). The worker daemon passes an explicit list instead, so this
+    same function runs identically whether invoked as a subprocess or
+    in-process inside the persistent worker."""
     parser = argparse.ArgumentParser(description="Appeal Document Scanner")
     parser.add_argument("--file", action="append",
                         help="Path to PDF (repeat for multiple volumes, processed in order)")
@@ -307,7 +311,7 @@ def main():
                              "embedding base64 in JSON. Only valid with --mode write. "
                              "Used by the streaming HTTP route to avoid the ~33%% base64 "
                              "inflation and JSON parsing overhead.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.file:
         parser.error("at least one --file is required")
@@ -323,7 +327,8 @@ def main():
                      "(auto-sign every annex page) or --sign-pages (sign listed main "
                      "pages). Pass one or the other.")
 
-    if (args.special_sig_client or args.special_sig_advocate or args.special_sig_client2) and not args.sign_pages:
+    special_sig_given = args.special_sig_client or args.special_sig_advocate or args.special_sig_client2
+    if special_sig_given and not args.sign_pages:
         parser.error("--special-sig-client / --special-sig-advocate require --sign-pages "
                      "(they only apply to the listed main pages).")
 
@@ -394,9 +399,12 @@ def main():
                     sig_note = ""
                     if args.client_sig or args.advocate_sig or args.client2_sig:
                         parts = []
-                        if args.client_sig: parts.append("client")
-                        if args.client2_sig: parts.append("client2")
-                        if args.advocate_sig: parts.append("advocate")
+                        if args.client_sig:
+                            parts.append("client")
+                        if args.client2_sig:
+                            parts.append("client2")
+                        if args.advocate_sig:
+                            parts.append("advocate")
                         sig_note = f" with {'+'.join(parts)} sig"
                     print(
                         f"Appended {len(args.annex)} annexure(s){sig_note} (in-memory)",
@@ -472,8 +480,10 @@ def main():
             sig_note = ""
             if args.client_sig or args.advocate_sig:
                 parts = []
-                if args.client_sig: parts.append("client")
-                if args.advocate_sig: parts.append("advocate")
+                if args.client_sig:
+                    parts.append("client")
+                if args.advocate_sig:
+                    parts.append("advocate")
                 sig_note = f" with {'+'.join(parts)} sig"
             print(f"Appended {len(args.annex)} annexure(s){sig_note} -> {target_path}", file=sys.stderr)
         else:

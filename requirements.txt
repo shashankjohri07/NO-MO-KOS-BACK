@@ -1,0 +1,9 @@
+# Mirrors the Dockerfile's `pip3 install` line — kept in sync by hand since
+# the Dockerfile doesn't use this file (it installs directly), but CI and
+# local dev need a pinned-ish list to install from without a Docker build.
+pymupdf
+pytesseract
+pillow
+
+# Test-only, not needed by the running service:
+pytest

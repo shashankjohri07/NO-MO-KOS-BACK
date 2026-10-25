@@ -1,0 +1,27 @@
+name: Keep Render dyno warm
+
+# Render's free tier spins the web service down after ~15 minutes with no
+# inbound traffic, so the FIRST request after any idle period pays a
+# 10-20s cold start (see NO-MI-KOS-FRONT/README.md) — a brutal first
+# impression for someone trying the tool for the first time. A periodic
+# health-check ping is genuine inbound HTTP traffic, so it keeps the dyno
+# awake without needing Render's paid "always on" tier.
+#
+# This is a stopgap, not a fix: it buys good first-load latency at zero
+# cost while the product is pre-revenue-scale. The real fix, once there's
+# real traffic/revenue to justify it, is paying for a tier that doesn't
+# sleep at all.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /api/health
+        run: |
+          curl -sf --max-time 30 https://no-mi-kos-back.onrender.com/api/health \
+            && echo "backend warm" \
+            || echo "::warning::health ping failed (dyno may be cold-starting or down)"

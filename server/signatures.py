@@ -39,6 +39,26 @@ from typing import Optional
 
 from config import fitz
 
+# Cache size cap. In the old per-request subprocess model these dicts died
+# with the process every request, so they could never grow unbounded. Now
+# that the persistent worker keeps one process alive across every request
+# (see worker.py), every uploaded signature's temp path is a distinct key
+# forever, so an uncapped cache would leak memory for the life of the
+# worker. FIFO eviction once over the cap keeps it bounded; the handful of
+# signature files reused across one filing's pages always stay hot because
+# eviction only removes the OLDEST entry once a new one pushes past the cap.
+_CACHE_MAX = 256
+
+
+def _bounded_set(cache: dict, key, value, on_evict=None) -> None:
+    cache[key] = value
+    while len(cache) > _CACHE_MAX:
+        old_key, old_value = next(iter(cache.items()))
+        del cache[old_key]
+        if on_evict:
+            on_evict(old_key, old_value)
+
+
 # Cache: image path -> aspect ratio (or None). The same one or two signature
 # files are measured on EVERY page of a filing, so without this a 100-page
 # document costs ~200 disk opens instead of 2.
@@ -63,7 +83,7 @@ def _read_image_aspect(path: str) -> float | None:
         pass
     except Exception as e:
         print(f"  could not read image {path}: {e}", file=sys.stderr)
-    _ASPECT_CACHE[path] = aspect
+    _bounded_set(_ASPECT_CACHE, path, aspect)
     return aspect
 
 
@@ -115,7 +135,16 @@ def _transparent_signature(path: str) -> str:
     except Exception as e:
         print(f"  signature transparency failed for {path}: {e}", file=sys.stderr)
 
-    _TRANSPARENT_CACHE[path] = result
+    def _evict_temp(_evicted_src, evicted_result) -> None:
+        # Same guard as _cleanup_transparent_temps: on PIL failure the cached
+        # value IS the original path, which must never be deleted.
+        if evicted_result != _evicted_src and os.path.exists(evicted_result):
+            try:
+                os.unlink(evicted_result)
+            except OSError:
+                pass
+
+    _bounded_set(_TRANSPARENT_CACHE, path, result, on_evict=_evict_temp)
     return result
 
 
