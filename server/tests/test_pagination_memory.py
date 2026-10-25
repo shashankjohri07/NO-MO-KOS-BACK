@@ -10,11 +10,16 @@ filing. pagination.py now periodically round-trips the document through
 save+reopen to flush that accumulated state — see _REDACT_FLUSH_EVERY's
 docstring in pagination.py for the measured before/after numbers.
 
-These tests lock in the CONTRACT change this fix required (paginate_doc
-now returns the document, or None, instead of a bool — because the
-periodic flush can reassign `doc` to a new object mid-call, so a caller
-holding its own separate reference would silently operate on a stale,
-closed one) and that the flush doesn't corrupt output.
+A second, independent mitigation skips pages where the redaction zone
+has nothing in it at all (the common case: a first-time upload has no
+stale number to remove) — a pure no-op skipped, not a behavior change.
+See _zone_has_content's docstring in pagination.py.
+
+These tests lock in the CONTRACT change the flush fix required
+(paginate_doc now returns the document, or None, instead of a bool —
+because the periodic flush can reassign `doc` to a new object mid-call,
+so a caller holding its own separate reference would silently operate on
+a stale, closed one) and that neither mitigation corrupts output.
 """
 
 import sys
@@ -27,10 +32,17 @@ from pagination import paginate_doc
 from PIL import Image
 
 
-def _make_image_heavy_pdf(tmp_path, pages: int) -> str:
+def _make_image_heavy_pdf(tmp_path, pages: int, stale_number: bool = True) -> str:
     """Each page gets a genuinely distinct JPEG (not dedup-able, unlike a
     repeated identical image) so apply_redactions has real decode work to
-    do on every page — the exact shape that triggers the memory growth."""
+    do on every page — the exact shape that triggers the memory growth.
+
+    `stale_number=True` (the default) stamps a number in the redaction
+    zone, simulating a filing that's being re-processed (already has a
+    page number there) — the case that NEEDS redaction, as opposed to a
+    first-time upload's genuinely blank corner (see
+    test_skip_blank_zone_pages_entirely, which wants stale_number=False).
+    """
     doc = fitz.open()
     for i in range(pages):
         img = Image.new("RGB", (600, 850), (250 - i % 5, 248, 245))
@@ -38,6 +50,12 @@ def _make_image_heavy_pdf(tmp_path, pages: int) -> str:
         img.save(img_path, "JPEG", quality=70)
         page = doc.new_page(width=595, height=842)
         page.insert_image(page.rect, filename=img_path)
+        if stale_number:
+            # "999" on every page -- deliberately NOT what Pass 2 would
+            # stamp (page i gets fresh digit i+1), so a test can tell
+            # "old stale value correctly removed" apart from "coincidentally
+            # already matched the new value".
+            page.insert_text((540, 35), "999", fontsize=10)
     path = str(tmp_path / "heavy.pdf")
     doc.save(path, garbage=3, deflate=True)
     doc.close()
@@ -108,4 +126,63 @@ def test_flush_actually_reopens_the_document(tmp_path, monkeypatch):
 
     # 60 pages / flush_every=10 -> 6 flush points mid-loop.
     assert len(reopen_calls) == 6
+    result.close()
+
+
+def test_skip_blank_zone_pages_entirely(tmp_path, monkeypatch):
+    """A page with nothing in the redaction zone (first-time upload, no
+    stale number) must not call apply_redactions at all — same output
+    either way (redacting blank space is a no-op), but skipping the call
+    avoids the expensive decode that produces it. Verified via call count,
+    not memory bytes, for the same portability reason as the flush test
+    above."""
+    import pagination
+
+    path = _make_image_heavy_pdf(tmp_path, pages=10, stale_number=False)
+
+    redact_calls = []
+    real_apply = fitz.Page.apply_redactions
+
+    def counting_apply(self, *a, **kw):
+        redact_calls.append(1)
+        return real_apply(self, *a, **kw)
+
+    monkeypatch.setattr(fitz.Page, "apply_redactions", counting_apply)
+
+    doc = fitz.open(path)
+    result = pagination.paginate_doc(doc, 0)
+    assert result is not None
+    assert len(result) == 10
+    assert redact_calls == [], "blank-zone pages must skip apply_redactions entirely"
+    result.close()
+
+
+def test_does_not_skip_pages_that_need_redaction(tmp_path, monkeypatch):
+    """The inverse of the above: a page WITH a stale number must still be
+    redacted — the skip-optimization must never cause it to be missed."""
+    import pagination
+
+    path = _make_image_heavy_pdf(tmp_path, pages=10, stale_number=True)
+
+    redact_calls = []
+    real_apply = fitz.Page.apply_redactions
+
+    def counting_apply(self, *a, **kw):
+        redact_calls.append(1)
+        return real_apply(self, *a, **kw)
+
+    monkeypatch.setattr(fitz.Page, "apply_redactions", counting_apply)
+
+    doc = fitz.open(path)
+    result = pagination.paginate_doc(doc, 0)
+    assert result is not None
+    assert len(redact_calls) == 10, "every page with a stale number must be redacted"
+
+    # And the stale "999" is actually gone (not just that apply_redactions
+    # was called — it must have had the right effect), replaced by Pass
+    # 2's fresh digit ("1" on page 0).
+    mask = fitz.Rect(0.75 * 595, 0, 595, 0.06 * 842)
+    zone_text = result[0].get_text("text", clip=mask).strip()
+    assert "999" not in zone_text, f"stale number survived redaction: {zone_text!r}"
+    assert zone_text == "1", f"expected Pass 2's fresh digit, got: {zone_text!r}"
     result.close()

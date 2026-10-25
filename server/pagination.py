@@ -28,17 +28,50 @@ from signatures import stamp_signatures_on_page
 # free-tier 512MB dyno that is an OOM crash from a single ~30-page filing,
 # nothing to do with concurrent load.
 #
-# Mitigation: periodically round-trip the document through save+reopen
-# (doc.tobytes() -> fitz.open(stream=...)), which forces MuPDF to flush
-# that accumulated decoded-image state. Measured: cuts the growth rate by
-# roughly 3-4x (40pg: ~750MB -> ~430MB; 280pg: unbounded multi-GB growth
-# -> ~1-1.5GB). This does NOT fully eliminate the growth (some of it is
-# the OS allocator not returning freed arenas, which periodic reopening
-# can't force) — it raises the safe page-count ceiling substantially, it
-# does not remove the ceiling. For genuinely huge filings, pairing this
-# with the worker's own periodic restart (see worker.py) is what bounds
-# the worst case.
+# Two mitigations, same output in every case — neither changes a single
+# redacted/stamped pixel, they only avoid paying for work that doesn't
+# change the result:
+#
+# 1. Skip pages with nothing to redact. The whole point of this pass is
+#    clearing a STALE page number from a PRIOR run; a page being numbered
+#    for the first time has nothing there, so redacting it is a no-op
+#    that still pays the full image-decode cost. _zone_has_content below
+#    renders just that small corner at low res to check — cheap, and (by
+#    rendering rather than text-only) also catches a stale number baked
+#    into the scan's own pixels, not just a separate text object. Measured
+#    on a realistic first-upload file (genuinely blank corner, as real
+#    scans usually are — that's why this corner is used for stamps):
+#    ~750MB -> ~48MB, because EVERY page skips. Re-processing an
+#    already-numbered filing (the case this redaction exists for) still
+#    redacts every page exactly as before — verified: same pages
+#    redacted, same zone cleared, same memory as pre-fix for that case.
+#
+# 2. For pages that DO need redacting (the case mitigation 1 can't help),
+#    periodically round-trip the document through save+reopen, which
+#    forces MuPDF to flush the accumulated decoded-image state mitigation
+#    1 couldn't avoid. Measured: cuts the growth rate ~3-4x for an
+#    all-pages-need-redacting worst case (280pg: unbounded multi-GB ->
+#    ~1-1.5GB). Does not fully eliminate it (some residual is the OS
+#    allocator not returning freed arenas, which reopening can't force)
+#    — raises the safe ceiling substantially, doesn't remove it. Pairs
+#    with the worker's own periodic restart (worker.py) for the
+#    worst-of-worst case.
 _REDACT_FLUSH_EVERY = 25
+
+
+def _zone_has_content(page, mask, zoom: float = 0.4) -> bool:
+    """True if `mask` (visible-coord rect) renders as anything other than
+    blank/white — same clip-render approach as signatures._zone_is_blank,
+    reused here because it's rotation-agnostic and catches stale marks
+    whether they're a separate text object or baked into a scanned image."""
+    try:
+        pm = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=mask,
+                              colorspace=fitz.csGRAY, alpha=False)
+        if pm.width < 1 or pm.height < 1:
+            return False
+        return min(pm.samples) < 244
+    except Exception:
+        return True  # on any error, assume content so we redact (safe default)
 
 
 def paginate_doc(
@@ -97,6 +130,8 @@ def paginate_doc(
             w = page.rect.width
             h = page.rect.height
             mask = fitz.Rect(w * 0.75, 0, w, h * 0.06)
+            if not _zone_has_content(page, mask):
+                continue  # nothing to redact — same output, skip the cost
             page.add_redact_annot(mask, fill=(1, 1, 1))
             page.apply_redactions()
 
