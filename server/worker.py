@@ -36,12 +36,10 @@ if _HERE not in sys.path:
 
 import bookmarks  # noqa: E402
 import error_detector  # noqa: E402
-import index_page  # noqa: E402
 
 _SCRIPTS = {
     "error_detector": error_detector.main,
     "bookmarks": bookmarks.main,
-    "index_page": index_page.main,
 }
 
 # Self-restart after this many jobs. Even with pagination.py's periodic

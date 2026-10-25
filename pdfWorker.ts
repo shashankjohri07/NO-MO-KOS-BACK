@@ -1,8 +1,8 @@
 /**
  * Drop-in replacement for `spawn('python3', [scriptPath, ...args], opts)`
- * for the PDF pipeline scripts (error_detector.py / bookmarks.py /
- * index_page.py), backed by the persistent worker (server/worker.py)
- * instead of a fresh subprocess per call.
+ * for the PDF pipeline scripts (error_detector.py / bookmarks.py),
+ * backed by the persistent worker (server/worker.py) instead of a fresh
+ * subprocess per call.
  *
  * Why: the old code spawned a brand-new python3 process for every upload,
  * paying PyMuPDF/PIL/pytesseract's import cost (and tesseract binary
