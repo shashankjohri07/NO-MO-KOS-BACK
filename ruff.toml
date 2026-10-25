@@ -1,0 +1,18 @@
+# Project lint config. Committed (unlike a machine-local ~/.config file) so
+# CI, the pre-commit hook, and every contributor's local `ruff check` all
+# agree on the same rules — no more "passes on my machine, fails in CI"
+# drift from one environment falling back to ruff's own defaults.
+line-length = 110
+target-version = "py310"
+
+[lint]
+select = [
+    "F",   # pyflakes -- undefined names, unused imports, etc.
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "I",   # import sorting
+    "UP",  # pyupgrade -- modern syntax
+    "B",   # bugbear -- likely bugs
+    "N",   # pep8-naming -- function/class/variable naming conventions
+    "RUF", # ruff-specific rules
+]

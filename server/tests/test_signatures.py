@@ -26,9 +26,8 @@ SERVER = os.path.dirname(HERE)
 sys.path.insert(0, SERVER)
 
 import fitz  # noqa: E402  (resolved via PyMuPDF, same as config.fitz)
-from PIL import Image, ImageDraw  # noqa: E402
-
 import signatures  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
 
 LINE = "In the matter of the IBC 2016, the RP respectfully submits the following."
 PASS = 0
@@ -115,8 +114,8 @@ def max_text_y(page):
     out = 0.0
     for b in page.get_text("dict")["blocks"]:
         if b.get("type") == 0:
-            for l in b.get("lines", []):
-                for s in l.get("spans", []):
+            for line in b.get("lines", []):
+                for s in line.get("spans", []):
                     out = max(out, s["bbox"][3])
     return out
 
@@ -246,11 +245,16 @@ def test_cli(tmp):
     print("CLI end-to-end:")
     ink, photo = make_sig_images(tmp)
     main = os.path.join(tmp, "m.pdf")
-    d = fitz.open(); d.new_page().insert_text((72, 72), "MAIN"); d.save(main)
+    d = fitz.open()
+    d.new_page().insert_text((72, 72), "MAIN")
+    d.save(main)
 
     mixed = os.path.join(tmp, "mixed.pdf")
     d = fitz.open()
-    normal_page(d); dense_page(d); both_dense_page(d); scan_page(d, tmp)
+    normal_page(d)
+    dense_page(d)
+    both_dense_page(d)
+    scan_page(d, tmp)
     d.save(mixed)
 
     out = os.path.join(tmp, "out.pdf")

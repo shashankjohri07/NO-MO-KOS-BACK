@@ -418,13 +418,14 @@ def main(argv=None):
                 # provided, falling back to the annexure signatures for
                 # backward compat. Annexure pages were already stamped above,
                 # so the two sets stay independent.
-                if not paginate_doc(
+                doc = paginate_doc(
                     doc, args.index_end_page,
                     extra_sig_pages=extra_sig_physical,
                     client_sig_path=args.special_sig_client or args.client_sig,
                     advocate_sig_path=args.special_sig_advocate or args.advocate_sig,
                     client2_sig_path=args.special_sig_client2 or args.client2_sig,
-                ):
+                )
+                if doc is None:
                     print("write_pagination failed", file=sys.stderr)
                     sys.exit(1)
 
@@ -433,7 +434,11 @@ def main(argv=None):
                 created_temps.append(out_tmp.name)
                 doc.save(out_tmp.name, garbage=3, deflate=True)
             finally:
-                doc.close()
+                # doc may have been reassigned (paginate_doc's periodic
+                # memory flush reopens it) or be None (paginate_doc failed,
+                # already closed its own doc internally before returning).
+                if doc is not None:
+                    doc.close()
             # Stream in chunks instead of f.read(): a 300MB filing no longer
             # doubles its footprint in this process's RAM on the way out.
             with open(out_tmp.name, "rb") as f:

@@ -14,24 +14,55 @@ Pure module split — no logic changes.
 """
 
 import sys
-from typing import Dict, List, Optional, Set
 
 from config import fitz
 from signatures import stamp_signatures_on_page
+
+#  apply_redactions() rewrites a page's content stream, which forces MuPDF
+# to decode any embedded image on that page into a raw bitmap — and on an
+# image-heavy (scanned) document, that decoded bitmap is never released for
+# the rest of the document's life. Measured: a 40-page scanned-style PDF
+# climbs to ~750MB RSS redacting alone (~18MB/page, linear in page count,
+# confirmed via `del page; gc.collect()` NOT reducing it — this is retained
+# by the Document object itself, not a GC-able per-page temporary). On a
+# free-tier 512MB dyno that is an OOM crash from a single ~30-page filing,
+# nothing to do with concurrent load.
+#
+# Mitigation: periodically round-trip the document through save+reopen
+# (doc.tobytes() -> fitz.open(stream=...)), which forces MuPDF to flush
+# that accumulated decoded-image state. Measured: cuts the growth rate by
+# roughly 3-4x (40pg: ~750MB -> ~430MB; 280pg: unbounded multi-GB growth
+# -> ~1-1.5GB). This does NOT fully eliminate the growth (some of it is
+# the OS allocator not returning freed arenas, which periodic reopening
+# can't force) — it raises the safe page-count ceiling substantially, it
+# does not remove the ceiling. For genuinely huge filings, pairing this
+# with the worker's own periodic restart (see worker.py) is what bounds
+# the worst case.
+_REDACT_FLUSH_EVERY = 25
 
 
 def paginate_doc(
     doc,
     index_end_page: int,
-    extra_sig_pages: Optional[Set[int]] = None,
-    client_sig_path: Optional[str] = None,
-    advocate_sig_path: Optional[str] = None,
-    client2_sig_path: Optional[str] = None,
-) -> bool:
+    extra_sig_pages: set[int] | None = None,
+    client_sig_path: str | None = None,
+    advocate_sig_path: str | None = None,
+    client2_sig_path: str | None = None,
+):
     """Redact + stamp page numbers (and optional extra signatures) on the
     OPEN document `doc`. Core of write_pagination, split out so the streaming
     hot path can run merge -> annexures -> pagination on ONE in-memory
-    document and save once at the end. Does not save or close `doc`.
+    document and save once at the end. Does not save `doc`.
+
+    Returns the document to use from here on (see _REDACT_FLUSH_EVERY: the
+    periodic memory flush below closes and reopens `doc`, so the object the
+    CALLER already holds can become stale mid-call) — callers MUST do
+    `doc = paginate_doc(doc, ...)` and check for None, not treat `doc` as
+    still valid by reference and check a bool. Returns None on failure
+    (original callers' `if not paginate_doc(...)` already treated falsy as
+    failure, and None is falsy, so a caller that hasn't been updated to
+    capture the return value fails loudly instead of silently operating on
+    a closed document).
     """
     try:
         total = len(doc)
@@ -41,12 +72,17 @@ def paginate_doc(
                 f"for {total}-page doc",
                 file=sys.stderr,
             )
-            return False
+            # Close it ourselves: now that `doc` is a return value (not a
+            # stable-by-reference object the caller already holds), a
+            # caller that captures `doc = paginate_doc(...)` has nothing
+            # left to close once this returns None.
+            doc.close()
+            return None
 
-        FONTSIZE = 14
-        FONTNAME = "helv"
-        TOP_MARGIN = 28
-        RIGHT_MARGIN = 36
+        fontsize = 14
+        fontname = "helv"
+        top_margin = 28
+        right_margin = 36
 
         # Pass 1: redact top-right zone on every post-index page. We can't
         # interleave redactions and inserts because apply_redactions
@@ -55,6 +91,7 @@ def paginate_doc(
         # Rotation note: add_redact_annot accepts coordinates in the page's
         # CURRENT (rotation-aware) coord system, so using page.rect.width
         # / .height directly stays correct for rotated pages.
+        pages_since_flush = 0
         for i in range(index_end_page, total):
             page = doc[i]
             w = page.rect.width
@@ -62,6 +99,13 @@ def paginate_doc(
             mask = fitz.Rect(w * 0.75, 0, w, h * 0.06)
             page.add_redact_annot(mask, fill=(1, 1, 1))
             page.apply_redactions()
+
+            pages_since_flush += 1
+            if pages_since_flush >= _REDACT_FLUSH_EVERY:
+                pages_since_flush = 0
+                buf = doc.tobytes(garbage=3, deflate=True)
+                doc.close()
+                doc = fitz.open(stream=buf, filetype="pdf")
 
         # Pass 2: stamp the fresh digit.
         #
@@ -77,16 +121,16 @@ def paginate_doc(
             number = i - index_end_page + 1
             text = str(number)
             w = page.rect.width
-            text_width = fitz.get_text_length(text, fontsize=FONTSIZE, fontname=FONTNAME)
-            x_visible = w - RIGHT_MARGIN - text_width
-            y_visible = TOP_MARGIN + FONTSIZE
+            text_width = fitz.get_text_length(text, fontsize=fontsize, fontname=fontname)
+            x_visible = w - right_margin - text_width
+            y_visible = top_margin + fontsize
             point_mediabox = fitz.Point(x_visible, y_visible) * page.derotation_matrix
             try:
                 page.insert_text(
                     point_mediabox,
                     text,
-                    fontsize=FONTSIZE,
-                    fontname=FONTNAME,
+                    fontsize=fontsize,
+                    fontname=fontname,
                     color=(0, 0, 0),
                     rotate=page.rotation,
                 )
@@ -122,20 +166,28 @@ def paginate_doc(
                         file=sys.stderr,
                     )
 
-        return True
+        return doc
     except Exception as e:
         print(f"write_pagination error: {e}", file=sys.stderr)
-        return False
+        # Close whatever `doc` currently refers to (it may have been
+        # reassigned by the periodic memory flush above before the
+        # failure) so a caller that only gets None back isn't left with
+        # an orphaned fitz.Document it has no reference to close.
+        try:
+            doc.close()
+        except Exception:
+            pass
+        return None
 
 
 def write_pagination(
     input_path: str,
     output_path: str,
     index_end_page: int,
-    extra_sig_pages: Optional[Set[int]] = None,
-    client_sig_path: Optional[str] = None,
-    advocate_sig_path: Optional[str] = None,
-    client2_sig_path: Optional[str] = None,
+    extra_sig_pages: set[int] | None = None,
+    client_sig_path: str | None = None,
+    advocate_sig_path: str | None = None,
+    client2_sig_path: str | None = None,
 ) -> bool:
     """Stamp sequential page numbers in the top-right corner of every page
     after the user-supplied index range.
@@ -164,13 +216,14 @@ def write_pagination(
     doc = None
     try:
         doc = fitz.open(input_path)
-        if not paginate_doc(
+        doc = paginate_doc(
             doc, index_end_page,
             extra_sig_pages=extra_sig_pages,
             client_sig_path=client_sig_path,
             advocate_sig_path=advocate_sig_path,
             client2_sig_path=client2_sig_path,
-        ):
+        )
+        if doc is None:
             return False
         doc.save(output_path, garbage=3, deflate=True)
         return True
@@ -220,7 +273,7 @@ def check_rule_pagination(pages: list, index_end_page: int) -> dict:
 
     missing_pages = []
     wrong_pages = []
-    seen_numbers: Dict[int, List[int]] = {}
+    seen_numbers: dict[int, list[int]] = {}
 
     for i, page in enumerate(paginated):
         expected = i + 1
@@ -241,7 +294,7 @@ def check_rule_pagination(pages: list, index_end_page: int) -> dict:
     duplicates = {n: phys for n, phys in seen_numbers.items() if len(phys) > 1}
 
     issues = []
-    refs: List[Dict[str, int]] = []
+    refs: list[dict[str, int]] = []
 
     if missing_pages:
         miss_list = ", ".join(str(m["physical"]) for m in missing_pages[:15])

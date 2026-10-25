@@ -44,6 +44,21 @@ _SCRIPTS = {
     "index_page": index_page.main,
 }
 
+# Self-restart after this many jobs. Even with pagination.py's periodic
+# save/reopen flush bounding growth WITHIN one request (measured: a
+# worst-case 280-page all-scanned-image filing went from ~1.8GB to ~850MB
+# peak), this is a long-lived process — some residual RSS isn't returned
+# to the OS between requests (confirmed: idle baseline climbs after a
+# heavy job and never fully comes back down). Over enough requests that
+# residual could still creep the baseline up. Restarting periodically
+# resets it to a clean process, same as a redeploy would. pdfWorker.ts's
+# `proc.on('exit', ...)` already auto-restarts within 2s (built for crash
+# recovery), so this reuses that exact path rather than needing new
+# machinery — a `/run` request that lands during the ~2s restart window
+# transparently falls back to pdfWorker.ts's per-request spawn().
+_RESTART_AFTER_JOBS = 50
+_jobs_handled = 0
+
 
 class _CapturingStdout:
     """Stands in for sys.stdout during a job. Scripts in this codebase
@@ -158,6 +173,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Stderr-B64", stderr_b64)
         self.end_headers()
         self.wfile.write(stdout_bytes)
+
+        global _jobs_handled
+        _jobs_handled += 1
+        if _jobs_handled >= _RESTART_AFTER_JOBS:
+            print(
+                f"[worker] {_jobs_handled} jobs handled, restarting to reclaim "
+                f"residual memory (pid {os.getpid()})",
+                file=sys.stderr,
+            )
+            # The response above is already fully written and flushed, so
+            # it's safe to exit immediately now. Not server.shutdown() —
+            # that blocks waiting for serve_forever()'s own loop to notice,
+            # which can't happen since we ARE that loop's current callback
+            # (this server has no ThreadingMixIn); os._exit skips Python
+            # cleanup entirely, which is fine, there's nothing to flush.
+            os._exit(0)
 
 
 def main():

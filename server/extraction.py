@@ -13,20 +13,19 @@ deploying — write-only paths sidestep this.
 import io
 import re
 import sys
-from typing import List, Optional
 
 from config import (
     MIN_TEXT_CHARS,
-    tesseract_available,
     TESSERACT_CONFIG,
     TESSERACT_CONFIG_SINGLE_LINE,
     TESSERACT_DPI,
     TESSERACT_PAGENUM_DPI,
     fitz,
+    tesseract_available,
 )
 
 
-def _ocr_page_with_tesseract(doc, page_idx: int, page_num: int) -> Optional[str]:
+def _ocr_page_with_tesseract(doc, page_idx: int, page_num: int) -> str | None:
     """OCR a single page using Tesseract. Returns None on any failure."""
     if not tesseract_available() or not fitz:
         return None
@@ -47,12 +46,12 @@ def _ocr_page_with_tesseract(doc, page_idx: int, page_num: int) -> Optional[str]
         return None
 
 
-def _ocr_topright_page_number(doc, page_idx: int) -> Optional[int]:
+def _ocr_topright_page_number(doc, page_idx: int) -> int | None:
     """OCR the top-right corner for a printed page number.
 
     Two-pass strategy:
-      Pass 1 (tight + strict): top 8% × right 25%, digit-only whitelist.
-      Pass 2 (wider + lenient): top 14% × right 35%, full PSM 6, line-by-line.
+      Pass 1 (tight + strict): top 8% x right 25%, digit-only whitelist.
+      Pass 2 (wider + lenient): top 14% x right 35%, full PSM 6, line-by-line.
         Filters out lines noisy with punctuation (degraded scans).
     """
     if not tesseract_available() or not fitz:
@@ -103,7 +102,7 @@ def _ocr_topright_page_number(doc, page_idx: int) -> Optional[int]:
 _PAGENUM_RE = re.compile(r"^[^\w]?(\d{1,4})[^\w]?$")
 
 
-def _bare_digit(text: str) -> Optional[int]:
+def _bare_digit(text: str) -> int | None:
     """A 1-4 digit number, optionally with one leading and one trailing
     non-word char (typical scan artefacts: leading apostrophe, trailing
     dash). Rejects mangled text like "1//-" or "1.•)" that happens to
@@ -115,10 +114,10 @@ def _bare_digit(text: str) -> Optional[int]:
     return n if 1 <= n <= 9999 else None
 
 
-def _extract_printed_page_number(page: dict) -> Optional[int]:
+def _extract_printed_page_number(page: dict) -> int | None:
     """Strict bare-digit number from the top-right corner only.
 
-    Geometry: top ~6% × right ~25%. A looser cutoff falsely picks up
+    Geometry: top ~6% x right ~25%. A looser cutoff falsely picks up
     centered title text like "I.A. (PLAN) NO. 104 OF 2025".
     """
     page_width = page.get("width", 595)
@@ -170,8 +169,8 @@ def extract_pages(file_path: str) -> dict:
     doc = None
     try:
         doc = fitz.open(file_path)
-        pages: List[dict] = []
-        ocr_pages: List[int] = []
+        pages: list[dict] = []
+        ocr_pages: list[int] = []
         ocr_method = "pymupdf"
 
         for i, page in enumerate(doc):
