@@ -28,7 +28,6 @@ import json
 import re
 import sys
 from collections import Counter
-from typing import Dict, List, Optional
 
 from config import fitz
 from merge import merge_to_doc
@@ -81,7 +80,7 @@ def _body_font_size(doc) -> float:
     return sizes.most_common(1)[0][0] if sizes else 11.0
 
 
-def detect_bookmarks(doc) -> Dict:
+def detect_bookmarks(doc) -> dict:
     """Run detection over the open document and return the proposal dict.
 
     If the PDF already embeds a TOC we trust it outright (confidence 1.0,
@@ -104,7 +103,7 @@ def detect_bookmarks(doc) -> Dict:
         return {"ok": True, "existing_toc": True, "headings": headings}
 
     body_size = _body_font_size(doc)
-    headings: List[Dict] = []
+    headings: list[dict] = []
 
     for pno, page in enumerate(doc, start=1):
         for block in page.get_text("dict")["blocks"]:
@@ -156,7 +155,7 @@ def detect_bookmarks(doc) -> Dict:
 
     # De-dupe: identical title+page pairs (multi-column layouts double-hit),
     # keeping the higher-confidence one.
-    best: Dict = {}
+    best: dict = {}
     for h in headings:
         key = (h["title"], h["page"])
         if key not in best or h["confidence"] > best[key]["confidence"]:
@@ -173,7 +172,7 @@ def detect_bookmarks(doc) -> Dict:
     return {"ok": True, "existing_toc": False, "headings": ordered}
 
 
-def apply_bookmarks(doc, headings: List[Dict]) -> bool:
+def apply_bookmarks(doc, headings: list[dict]) -> bool:
     """Inject the finalized tree into the open document via set_toc.
     Entries are re-clamped (level jumps, page bounds) because the list has
     round-tripped through the browser and may have been hand-edited."""
@@ -199,7 +198,7 @@ def apply_bookmarks(doc, headings: List[Dict]) -> bool:
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
-def _open_merged(paths: List[str]):
+def _open_merged(paths: list[str]):
     """One path opens directly; several merge in order (same volume
     semantics as the pagination pipeline)."""
     if fitz is None:
@@ -212,7 +211,7 @@ def _open_merged(paths: List[str]):
     return doc
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Bookmark detect/apply")
     parser.add_argument("command", choices=("detect", "apply"))
     parser.add_argument("--file", action="append", required=True,
@@ -220,7 +219,7 @@ def main():
     parser.add_argument("--toc-json", default=None,
                         help="apply only: path to the finalized headings JSON "
                              '(either a bare list or {"headings": [...]})')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     doc = _open_merged(args.file)
 
@@ -230,7 +229,7 @@ def main():
 
     if not args.toc_json:
         parser.error("apply requires --toc-json")
-    with open(args.toc_json, "r", encoding="utf-8") as f:
+    with open(args.toc_json, encoding="utf-8") as f:
         payload = json.load(f)
     headings = payload["headings"] if isinstance(payload, dict) else payload
 

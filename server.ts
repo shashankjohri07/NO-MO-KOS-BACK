@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs';
@@ -15,6 +14,7 @@ import {
 } from './billing';
 import { sendEventEmail, emailMode, renderEventEmail, applyEmailConfig, currentSender, type EmailConfig } from './email';
 import { removeBackground } from './removebg';
+import { startPdfWorker, runPythonJob } from './pdfWorker';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -24,6 +24,12 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
+
+// Starts the persistent PDF worker (server/worker.py) once at boot so it's
+// warm before the first upload arrives. Every python3 invocation below goes
+// through runPythonJob(), which uses this worker once it's ready and falls
+// back to the old per-request spawn() until then. See pdfWorker.ts.
+startPdfWorker(join(__dirname, 'server'));
 
 // Per-file upload cap. Matches the nginx `client_max_body_size 500m`
 // fronting the static / proxy layer — going higher here is pointless because
@@ -779,17 +785,7 @@ app.post('/api/detect-errors', upload.array('document', 5), async (req: Request,
     args.push('--mode', mode);
 
     const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      const proc = spawn('python3', args, {
-        cwd: join(__dirname, 'server'),
-        env: {
-          ...process.env,
-          // User PATH first (so pyenv/system python with installed deps wins),
-          // brew/system bin paths appended for tesseract binary discovery.
-          PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
-          PYTHONPATH: join(__dirname, 'server'),
-        },
-        timeout: 600_000,
-      });
+      const proc = runPythonJob(args, { cwd: join(__dirname, 'server'), timeout: 600_000 });
 
       let stdout = '';
       let stderr = '';
@@ -989,15 +985,7 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
   args.push('--mode', 'write');
   args.push('--write-stdout');
 
-  const proc = spawn('python3', args, {
-    cwd: join(__dirname, 'server'),
-    env: {
-      ...process.env,
-      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
-      PYTHONPATH: join(__dirname, 'server'),
-    },
-    timeout: 600_000,
-  });
+  const proc = runPythonJob(args, { cwd: join(__dirname, 'server'), timeout: 600_000 });
 
   // Headers go out the moment the first byte arrives. We choose a sensible
   // download filename derived from the first input.
@@ -1068,15 +1056,7 @@ app.post('/api/bookmarks/detect', upload.array('document', 5), (req: Request, re
   const args = [join(__dirname, 'server', 'bookmarks.py'), 'detect'];
   for (const p of paths) args.push('--file', p);
 
-  const proc = spawn('python3', args, {
-    cwd: join(__dirname, 'server'),
-    env: {
-      ...process.env,
-      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
-      PYTHONPATH: join(__dirname, 'server'),
-    },
-    timeout: 300_000,
-  });
+  const proc = runPythonJob(args, { cwd: join(__dirname, 'server'), timeout: 300_000 });
 
   let stdoutBuf = '';
   let stderrBuf = '';
@@ -1139,15 +1119,7 @@ app.post('/api/bookmarks/apply', upload.array('document', 5), (req: Request, res
   const args = [join(__dirname, 'server', 'bookmarks.py'), 'apply', '--toc-json', tocPath];
   for (const p of paths) args.push('--file', p);
 
-  const proc = spawn('python3', args, {
-    cwd: join(__dirname, 'server'),
-    env: {
-      ...process.env,
-      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
-      PYTHONPATH: join(__dirname, 'server'),
-    },
-    timeout: 600_000,
-  });
+  const proc = runPythonJob(args, { cwd: join(__dirname, 'server'), timeout: 600_000 });
 
   const baseName = files[0].originalname.replace(/\.pdf$/i, '') || 'document';
   res.setHeader('Content-Type', 'application/pdf');
@@ -1221,15 +1193,7 @@ app.post('/api/index/generate', upload.array('document', 5), (req: Request, res:
   const args = [join(__dirname, 'server', 'index_page.py'), 'generate', '--payload', payloadPath];
   for (const p of paths) args.push('--file', p);
 
-  const proc = spawn('python3', args, {
-    cwd: join(__dirname, 'server'),
-    env: {
-      ...process.env,
-      PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin:/usr/bin`,
-      PYTHONPATH: join(__dirname, 'server'),
-    },
-    timeout: 600_000,
-  });
+  const proc = runPythonJob(args, { cwd: join(__dirname, 'server'), timeout: 600_000 });
 
   const baseName = files[0]?.originalname.replace(/\.pdf$/i, '') || 'index';
   const downloadName = files.length ? `INDEXED_${baseName}.pdf` : 'INDEX.pdf';

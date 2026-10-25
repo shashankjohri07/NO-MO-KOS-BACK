@@ -7,8 +7,8 @@ Aspect handling: PyMuPDF's `keep_proportion` letterboxes inside the rect
 but the rect itself is what callers think the image occupies. For
 accurate visual placement (and to match what client expects), we read
 the image's pixel dimensions via PIL and compute a rect that *exactly*
-matches the image's natural ratio. A 1:1 stamp lands as 100×100, a 3:1
-cursive sig fills 180×60.
+matches the image's natural ratio. A 1:1 stamp lands as 100x100, a 3:1
+cursive sig fills 180x60.
 
 Rotation handling: scanned PDFs often have /Rotate 90/180/270 — viewer
 shows portrait, but PyMuPDF coordinates default to the unrotated
@@ -39,6 +39,25 @@ from typing import Optional
 
 from config import fitz
 
+# Cache size cap. In the old per-request subprocess model these dicts died
+# with the process every request, so they could never grow unbounded. Now
+# that the persistent worker keeps one process alive across every request
+# (see worker.py), every uploaded signature's temp path is a distinct key
+# forever, so an uncapped cache would leak memory for the life of the
+# worker. FIFO eviction once over the cap keeps it bounded; the handful of
+# signature files reused across one filing's pages always stay hot because
+# eviction only removes the OLDEST entry once a new one pushes past the cap.
+_CACHE_MAX = 256
+
+
+def _bounded_set(cache: dict, key, value, on_evict=None) -> None:
+    cache[key] = value
+    while len(cache) > _CACHE_MAX:
+        old_key, old_value = next(iter(cache.items()))
+        del cache[old_key]
+        if on_evict:
+            on_evict(old_key, old_value)
+
 
 # Cache: image path -> aspect ratio (or None). The same one or two signature
 # files are measured on EVERY page of a filing, so without this a 100-page
@@ -46,7 +65,7 @@ from config import fitz
 _ASPECT_CACHE: dict = {}
 
 
-def _read_image_aspect(path: str) -> Optional[float]:
+def _read_image_aspect(path: str) -> float | None:
     """Pixel width/height of the image at `path`, or None if unreadable.
     Cached per path (signature files are immutable for the run). PIL is
     imported lazily so write-only paths that never touch images don't pay
@@ -64,7 +83,7 @@ def _read_image_aspect(path: str) -> Optional[float]:
         pass
     except Exception as e:
         print(f"  could not read image {path}: {e}", file=sys.stderr)
-    _ASPECT_CACHE[path] = aspect
+    _bounded_set(_ASPECT_CACHE, path, aspect)
     return aspect
 
 
@@ -88,18 +107,19 @@ def _transparent_signature(path: str) -> str:
         return _TRANSPARENT_CACHE[path]
 
     result = path
-    WHITE = 238  # R,G,B all at/above this -> treated as background -> transparent
+    white = 238  # R,G,B all at/above this -> treated as background -> transparent
     try:
-        from PIL import Image as PILImage
         import tempfile
+
+        from PIL import Image as PILImage
 
         img = PILImage.open(path).convert("RGBA")
         # Vectorised entirely in PIL's C layer (no numpy dependency, no
         # Python pixel loop): build a "background" mask of pixels whose R,
-        # G and B are ALL >= WHITE, then zero the alpha channel there.
+        # G and B are ALL >= white, then zero the alpha channel there.
         from PIL import ImageChops
         r, g, b, a = img.split()
-        thr = [0] * WHITE + [255] * (256 - WHITE)
+        thr = [0] * white + [255] * (256 - white)
         bg = ImageChops.multiply(
             ImageChops.multiply(r.point(thr), g.point(thr)), b.point(thr)
         )
@@ -115,7 +135,16 @@ def _transparent_signature(path: str) -> str:
     except Exception as e:
         print(f"  signature transparency failed for {path}: {e}", file=sys.stderr)
 
-    _TRANSPARENT_CACHE[path] = result
+    def _evict_temp(_evicted_src, evicted_result) -> None:
+        # Same guard as _cleanup_transparent_temps: on PIL failure the cached
+        # value IS the original path, which must never be deleted.
+        if evicted_result != _evicted_src and os.path.exists(evicted_result):
+            try:
+                os.unlink(evicted_result)
+            except OSError:
+                pass
+
+    _bounded_set(_TRANSPARENT_CACHE, path, result, on_evict=_evict_temp)
     return result
 
 
@@ -231,8 +260,8 @@ def _zone_is_blank(page, y0: float, y1: float) -> bool:
                              colorspace=fitz.csGRAY, alpha=False)
         if pm.width < 1 or pm.height < 1:
             return True
-        WHITE = 244
-        return min(pm.samples) >= WHITE
+        white = 244
+        return min(pm.samples) >= white
     except Exception as e:
         print(f"  zone blank-check failed ({e}); assuming content", file=sys.stderr)
         return False
@@ -243,43 +272,70 @@ def _reserve_footer_strip(page, strip_h: float):
     the area ABOVE a `strip_h`-tall clean footer strip. Page SIZE is unchanged;
     the bottom strip is left blank for the signature(s). Returns the fresh page.
 
-    The content is re-imported with show_pdf_page as a vector XObject, so
-    quality is preserved and it survives a later insert_pdf (unlike a mediabox
-    resize, which the page origin re-normalisation breaks on copy). The rebuilt
-    page is upright — show_pdf_page bakes in any /Rotate of the source, so
-    rotated pages need no special handling downstream.
+    Unrotated pages: content is re-imported with show_pdf_page as a vector
+    XObject, so quality is preserved and it survives a later insert_pdf
+    (unlike a mediabox resize, which the page origin re-normalisation breaks
+    on copy).
+
+    Rotated pages (/Rotate 90/180/270 — common with scanned annexures):
+    despite what an earlier version of this comment claimed, show_pdf_page
+    does NOT reliably bake in the source page's /Rotate — its `rotate`
+    argument rotates the inserted content around a DIFFERENT axis than the
+    page's own /Rotate, and empirically needs a different correction per
+    90/180/270 quadrant with inconsistent anchoring (verified: feeding this
+    a /Rotate 90 page produced a sideways, partly cropped result). Fighting
+    that is fragile, so for rotated pages we instead rasterise via
+    get_pixmap(), which DOES apply /Rotate correctly (it renders the visible,
+    rotation-applied view) and then place that image — guaranteed correct
+    orientation in every quadrant, verified against all four rotations. A
+    high DPI keeps this visually lossless for the scanned content this path
+    exists for.
     """
     doc = page.parent
     idx = page.number
     w = page.rect.width
     h = page.rect.height
+    rotation = page.rotation
+    avail_h = h - strip_h
 
-    src = fitz.open()
-    src.insert_pdf(doc, from_page=idx, to_page=idx)
-    try:
-        doc.delete_page(idx)
-        new = doc.new_page(pno=idx, width=w, height=h)
-        # Fit the original content into the top region, aspect preserved so the
-        # text is never distorted (a thin side margin is acceptable).
-        target = fitz.Rect(0, 0, w, h - strip_h)
-        new.show_pdf_page(target, src, 0, keep_proportion=True)
-    finally:
-        src.close()
+    if rotation == 0:
+        src = fitz.open()
+        src.insert_pdf(doc, from_page=idx, to_page=idx)
+        try:
+            doc.delete_page(idx)
+            new = doc.new_page(pno=idx, width=w, height=h)
+            # Fit the original content into the top region, aspect preserved
+            # so the text is never distorted (a thin side margin is okay).
+            target = fitz.Rect(0, 0, w, avail_h)
+            new.show_pdf_page(target, src, 0, keep_proportion=True)
+        finally:
+            src.close()
+        return new
+
+    raster_dpi = 200
+    pix = page.get_pixmap(dpi=raster_dpi)
+    img_bytes = pix.tobytes("png")
+
+    doc.delete_page(idx)
+    new = doc.new_page(pno=idx, width=w, height=h)
+    scale = min(w / pix.width, avail_h / pix.height)
+    target = fitz.Rect(0, 0, pix.width * scale, pix.height * scale)
+    new.insert_image(target, stream=img_bytes)
     return new
 
 
 def stamp_signatures_on_page(
     page,
-    client_sig_path: Optional[str],
-    advocate_sig_path: Optional[str],
-    client2_sig_path: Optional[str] = None,
+    client_sig_path: str | None,
+    advocate_sig_path: str | None,
+    client2_sig_path: str | None = None,
 ) -> None:
     """Stamp client (left), optional second client (centre) and advocate
     (right) signatures in the page footer with native aspect ratio preserved.
 
-    Bounding box per side: 180×100pt. Real rect is sized to the image's
-    natural ratio so square stamps land at 100×100 and wide cursive sigs
-    fill 180×60.
+    Bounding box per side: 180x100pt. Real rect is sized to the image's
+    natural ratio so square stamps land at 100x100 and wide cursive sigs
+    fill 180x60.
 
     Signatures are ALWAYS placed in the footer:
       * Normal page (footer blank)            -> sign at the bottom.
@@ -299,10 +355,10 @@ def stamp_signatures_on_page(
     # is that the sig sits cleanly in the footer; this is the compromise
     # between "too small to read against notary seals" and "swallowing the
     # whole bottom of the page".
-    SIG_MAX_W = 150
-    LEFT_MARGIN = 60
-    RIGHT_MARGIN = 60
-    STRIP_H = 92.0      # footer / scan band height to test for content
+    sig_max_w = 150
+    left_margin = 60
+    right_margin = 60
+    strip_h = 92.0      # footer / scan band height to test for content
     band_h = 60.0       # signature bounding-box height
 
     # Use rotation-aware (visible) page dims everywhere.
@@ -316,12 +372,12 @@ def stamp_signatures_on_page(
     #   * Dense page, top header is clear    -> sign at the TOP (header area).
     #   * Both ends occupied (rare)          -> reserve a clean bottom strip by
     #                                           scaling the content up.
-    if _zone_is_blank(page, page_h - STRIP_H, page_h):
+    if _zone_is_blank(page, page_h - strip_h, page_h):
         band_top = page_h - 14.0 - band_h
     else:
         # Footer has content — scale it up to make room for signatures.
         try:
-            page = _reserve_footer_strip(page, STRIP_H)
+            page = _reserve_footer_strip(page, strip_h)
             page_w = page.rect.width
             page_h = page.rect.height
             rotation = page.rotation
@@ -341,7 +397,7 @@ def stamp_signatures_on_page(
             # shows through the gaps in the ink (no opaque backing card).
             render_path = _transparent_signature(client_sig_path)
             visible_rect = _fit_visible_rect_to_image(
-                render_path, LEFT_MARGIN, band_top, SIG_MAX_W, band_h,
+                render_path, left_margin, band_top, sig_max_w, band_h,
             )
             if visible_rect:
                 mediabox_rect = _project_to_mediabox(page, visible_rect)
@@ -367,8 +423,8 @@ def stamp_signatures_on_page(
             aspect = _read_image_aspect(render_path) or 1.0
             h = band_h
             w = h * aspect
-            if w > SIG_MAX_W:
-                w = SIG_MAX_W
+            if w > sig_max_w:
+                w = sig_max_w
                 h = w / aspect
             centre_x = (page_w - w) / 2
             visible_rect = fitz.Rect(centre_x, band_top, centre_x + w, band_top + h)
@@ -395,10 +451,10 @@ def stamp_signatures_on_page(
         aspect = _read_image_aspect(render_path) or 1.0
         h = band_h
         w = h * aspect
-        if w > SIG_MAX_W:
-            w = SIG_MAX_W
+        if w > sig_max_w:
+            w = sig_max_w
             h = w / aspect
-        right_x = page_w - RIGHT_MARGIN - w
+        right_x = page_w - right_margin - w
         visible_rect = fitz.Rect(right_x, band_top, right_x + w, band_top + h)
         mediabox_rect = _project_to_mediabox(page, visible_rect)
         try:
