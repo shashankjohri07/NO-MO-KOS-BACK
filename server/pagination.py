@@ -14,7 +14,6 @@ Pure module split — no logic changes.
 """
 
 import sys
-from typing import Dict, List, Optional, Set
 
 from config import fitz
 from signatures import stamp_signatures_on_page
@@ -23,10 +22,10 @@ from signatures import stamp_signatures_on_page
 def paginate_doc(
     doc,
     index_end_page: int,
-    extra_sig_pages: Optional[Set[int]] = None,
-    client_sig_path: Optional[str] = None,
-    advocate_sig_path: Optional[str] = None,
-    client2_sig_path: Optional[str] = None,
+    extra_sig_pages: set[int] | None = None,
+    client_sig_path: str | None = None,
+    advocate_sig_path: str | None = None,
+    client2_sig_path: str | None = None,
 ) -> bool:
     """Redact + stamp page numbers (and optional extra signatures) on the
     OPEN document `doc`. Core of write_pagination, split out so the streaming
@@ -43,10 +42,10 @@ def paginate_doc(
             )
             return False
 
-        FONTSIZE = 14
-        FONTNAME = "helv"
-        TOP_MARGIN = 28
-        RIGHT_MARGIN = 36
+        fontsize = 14
+        fontname = "helv"
+        top_margin = 28
+        right_margin = 36
 
         # Pass 1: redact top-right zone on every post-index page. We can't
         # interleave redactions and inserts because apply_redactions
@@ -77,16 +76,16 @@ def paginate_doc(
             number = i - index_end_page + 1
             text = str(number)
             w = page.rect.width
-            text_width = fitz.get_text_length(text, fontsize=FONTSIZE, fontname=FONTNAME)
-            x_visible = w - RIGHT_MARGIN - text_width
-            y_visible = TOP_MARGIN + FONTSIZE
+            text_width = fitz.get_text_length(text, fontsize=fontsize, fontname=fontname)
+            x_visible = w - right_margin - text_width
+            y_visible = top_margin + fontsize
             point_mediabox = fitz.Point(x_visible, y_visible) * page.derotation_matrix
             try:
                 page.insert_text(
                     point_mediabox,
                     text,
-                    fontsize=FONTSIZE,
-                    fontname=FONTNAME,
+                    fontsize=fontsize,
+                    fontname=fontname,
                     color=(0, 0, 0),
                     rotate=page.rotation,
                 )
@@ -132,10 +131,10 @@ def write_pagination(
     input_path: str,
     output_path: str,
     index_end_page: int,
-    extra_sig_pages: Optional[Set[int]] = None,
-    client_sig_path: Optional[str] = None,
-    advocate_sig_path: Optional[str] = None,
-    client2_sig_path: Optional[str] = None,
+    extra_sig_pages: set[int] | None = None,
+    client_sig_path: str | None = None,
+    advocate_sig_path: str | None = None,
+    client2_sig_path: str | None = None,
 ) -> bool:
     """Stamp sequential page numbers in the top-right corner of every page
     after the user-supplied index range.
@@ -220,7 +219,7 @@ def check_rule_pagination(pages: list, index_end_page: int) -> dict:
 
     missing_pages = []
     wrong_pages = []
-    seen_numbers: Dict[int, List[int]] = {}
+    seen_numbers: dict[int, list[int]] = {}
 
     for i, page in enumerate(paginated):
         expected = i + 1
@@ -241,7 +240,7 @@ def check_rule_pagination(pages: list, index_end_page: int) -> dict:
     duplicates = {n: phys for n, phys in seen_numbers.items() if len(phys) > 1}
 
     issues = []
-    refs: List[Dict[str, int]] = []
+    refs: list[dict[str, int]] = []
 
     if missing_pages:
         miss_list = ", ".join(str(m["physical"]) for m in missing_pages[:15])

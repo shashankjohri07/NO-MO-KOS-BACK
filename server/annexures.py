@@ -21,7 +21,6 @@ rotate=page.rotation so stamps appear correctly oriented at the visible
 
 import os
 import sys
-from typing import List, Optional
 
 from config import fitz
 from signatures import stamp_signatures_on_page
@@ -47,10 +46,10 @@ def stamp_annexure_label(page, label: str) -> None:
     """
     if not fitz:
         return
-    FONTSIZE = 22
-    FONTNAME = "hebo"   # Helvetica-Bold (PyMuPDF built-in)
-    Y_BASELINE = 30     # hug the very top of the paper
-    CARD_PAD = 6.0
+    fontsize = 22
+    fontname = "hebo"   # Helvetica-Bold (PyMuPDF built-in)
+    y_baseline = 30     # hug the very top of the paper
+    card_pad = 6.0
 
     def _to_mediabox(rect_visible):
         r = rect_visible * page.derotation_matrix
@@ -58,7 +57,7 @@ def stamp_annexure_label(page, label: str) -> None:
                          max(r.x0, r.x1), max(r.y0, r.y1))
 
     try:
-        text_w = fitz.get_text_length(label, fontsize=FONTSIZE, fontname=FONTNAME)
+        text_w = fitz.get_text_length(label, fontsize=fontsize, fontname=fontname)
         # page.rect IS rotation-aware → reflects the visible page dimensions
         visible_w = page.rect.width
         x_visible = (visible_w - text_w) / 2
@@ -66,10 +65,10 @@ def stamp_annexure_label(page, label: str) -> None:
         # Opaque white card behind the label so it reads cleanly even when the
         # annexure content runs to the very top edge. Drawn BEFORE the text.
         card_visible = fitz.Rect(
-            x_visible - CARD_PAD,
-            Y_BASELINE - FONTSIZE - CARD_PAD + 4,
-            x_visible + text_w + CARD_PAD,
-            Y_BASELINE + CARD_PAD,
+            x_visible - card_pad,
+            y_baseline - fontsize - card_pad + 4,
+            x_visible + text_w + card_pad,
+            y_baseline + card_pad,
         )
         try:
             page.draw_rect(_to_mediabox(card_visible), color=None,
@@ -79,12 +78,12 @@ def stamp_annexure_label(page, label: str) -> None:
 
         # Project visible-coord baseline to mediabox coord that insert_text
         # needs. For rotation==0 this is a no-op (derotation_matrix is identity).
-        point_mediabox = fitz.Point(x_visible, Y_BASELINE) * page.derotation_matrix
+        point_mediabox = fitz.Point(x_visible, y_baseline) * page.derotation_matrix
         page.insert_text(
             point_mediabox,
             label,
-            fontsize=FONTSIZE,
-            fontname=FONTNAME,
+            fontsize=fontsize,
+            fontname=fontname,
             color=(0, 0, 0),
             rotate=page.rotation,
         )
@@ -98,10 +97,10 @@ def stamp_annexure_label(page, label: str) -> None:
 
 def append_annexures_to_doc(
     doc,
-    annexure_paths: List[str],
-    client_sig_path: Optional[str] = None,
-    advocate_sig_path: Optional[str] = None,
-    client2_sig_path: Optional[str] = None,
+    annexure_paths: list[str],
+    client_sig_path: str | None = None,
+    advocate_sig_path: str | None = None,
+    client2_sig_path: str | None = None,
 ) -> bool:
     """Append each annexure file to the OPEN document `doc`, stamping the
     "Annexure A-N" label on each annexure's first page and (optionally) the
@@ -132,9 +131,12 @@ def append_annexures_to_doc(
                 # Footer signatures on every page of this annexure.
                 if client_sig_path or advocate_sig_path or client2_sig_path:
                     sides = []
-                    if client_sig_path: sides.append("client")
-                    if client2_sig_path: sides.append("client2")
-                    if advocate_sig_path: sides.append("advocate")
+                    if client_sig_path:
+                        sides.append("client")
+                    if client2_sig_path:
+                        sides.append("client2")
+                    if advocate_sig_path:
+                        sides.append("advocate")
                     print(
                         f"  stamping {'+'.join(sides)} sig on {len(annex)} "
                         f"page(s) of {os.path.basename(path)}",
@@ -168,10 +170,10 @@ def append_annexures_to_doc(
 
 def append_annexures_to_pdf(
     base_path: str,
-    annexure_paths: List[str],
+    annexure_paths: list[str],
     output_path: str,
-    client_sig_path: Optional[str] = None,
-    advocate_sig_path: Optional[str] = None,
+    client_sig_path: str | None = None,
+    advocate_sig_path: str | None = None,
 ) -> bool:
     """Append each annexure file to base_path with a centered "Annexure A-N"
     label stamped on the annexure's first page. N is sequential starting at 1.

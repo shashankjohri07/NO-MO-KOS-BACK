@@ -8,10 +8,9 @@ the production UI doesn't surface it.
 Pure module split — no logic changes.
 """
 
-from typing import List
 
 
-def check_rule_doc_upload(pages: List[dict]) -> dict:
+def check_rule_doc_upload(pages: list[dict]) -> dict:
     """All required sections must be present in the filing."""
     required_docs = {
         "Appeal/Petition": ["APPEAL", "PETITION", "COMP. APP", "COMPANY APPEAL"],

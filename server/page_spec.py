@@ -29,14 +29,13 @@ Bound-checking against actual document length is the caller's job — this
 parser stays pure so it's trivial to unit-test.
 """
 
-from typing import Set
 
 
 class PageSpecError(ValueError):
     """Raised when the input string can't be parsed into a page set."""
 
 
-def parse_page_spec(spec: str) -> Set[int]:
+def parse_page_spec(spec: str) -> set[int]:
     """Parse `spec` into a set of 1-indexed page numbers.
 
     Raises PageSpecError on malformed input. Returns empty set for
@@ -48,7 +47,7 @@ def parse_page_spec(spec: str) -> Set[int]:
     if not text:
         return set()
 
-    out: Set[int] = set()
+    out: set[int] = set()
     tokens = [t.strip() for t in text.split(",")]
     for tok in tokens:
         if not tok:
@@ -64,10 +63,10 @@ def parse_page_spec(spec: str) -> Set[int]:
             try:
                 lo = int(parts[0].strip())
                 hi = int(parts[1].strip())
-            except ValueError:
+            except ValueError as e:
                 raise PageSpecError(
                     f"Range '{tok}' contains non-numeric values."
-                )
+                ) from e
             if lo > hi:
                 lo, hi = hi, lo
             for n in range(lo, hi + 1):
@@ -76,17 +75,17 @@ def parse_page_spec(spec: str) -> Set[int]:
         else:
             try:
                 n = int(tok)
-            except ValueError:
+            except ValueError as e:
                 raise PageSpecError(
                     f"'{tok}' is not a number. Use comma-separated pages "
                     f"and ranges, e.g. '1, 3-5, 8'."
-                )
+                ) from e
             if n > 0:
                 out.add(n)
     return out
 
 
-def format_page_set(pages: Set[int]) -> str:
+def format_page_set(pages: set[int]) -> str:
     """Render a sorted page set back into a compact human string with
     ranges collapsed.  Mirror of parse_page_spec — useful for log lines
     and the "Will sign pages: …" preview the UI will eventually show.

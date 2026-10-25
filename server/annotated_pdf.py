@@ -9,12 +9,11 @@ Pure module split — no logic changes.
 """
 
 import sys
-from typing import List
 
 from config import COLOR_ERROR, COLOR_PASS, fitz
 
 
-def generate_annotated_pdf(input_path: str, output_path: str, results: List[dict]) -> bool:
+def generate_annotated_pdf(input_path: str, output_path: str, results: list[dict]) -> bool:
     """Generate a PDF with sticky-note annotations on pages with errors."""
     if not fitz:
         return False

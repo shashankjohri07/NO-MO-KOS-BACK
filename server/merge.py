@@ -7,12 +7,12 @@ of its insert_pdf() call).
 """
 
 import sys
-from typing import List, Optional
+from typing import Optional
 
 from config import fitz
 
 
-def merge_to_doc(input_paths: List[str]) -> Optional["fitz.Document"]:
+def merge_to_doc(input_paths: list[str]) -> Optional["fitz.Document"]:
     """Concatenate `input_paths` (in order) into one OPEN in-memory document
     and return it (caller owns the close). Returns None on failure.
 
@@ -36,7 +36,7 @@ def merge_to_doc(input_paths: List[str]) -> Optional["fitz.Document"]:
         return None
 
 
-def merge_pdfs(input_paths: List[str], output_path: str) -> bool:
+def merge_pdfs(input_paths: list[str], output_path: str) -> bool:
     """Concatenate `input_paths` (in order) into `output_path`.
 
     Returns True on success. Caller is responsible for cleanup of the
