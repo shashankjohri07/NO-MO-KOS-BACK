@@ -31,6 +31,7 @@ from collections import Counter
 
 from config import fitz
 from merge import merge_to_doc
+from pdf_limits import enforce_page_limit
 
 # ── Layer 1: pattern-based heading detection ─────────────────────────────
 # Each entry: (compiled regex, hierarchy level, confidence). Legal-filing
@@ -221,6 +222,7 @@ def main(argv=None):
                              '(either a bare list or {"headings": [...]})')
     args = parser.parse_args(argv)
 
+    enforce_page_limit(args.file)
     doc = _open_merged(args.file)
 
     if args.command == "detect":

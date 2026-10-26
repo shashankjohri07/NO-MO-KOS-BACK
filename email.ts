@@ -87,7 +87,25 @@ export function renderEventEmail(ev: EventRecord): { subject: string; html: stri
       })
     : '';
   const esc = (s: string) =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  // Only plain http(s) URLs may reach an src/href — blocks javascript:/data:
+  // links and attribute break-outs, since these go to every subscriber.
+  const safeUrl = (u: string | null | undefined): string | null => {
+    if (!u) return null;
+    try {
+      const parsed = new URL(u);
+      return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? esc(parsed.href) : null;
+    } catch {
+      return null;
+    }
+  };
+  const imageUrl = safeUrl(ev.image_url);
+  const linkUrl = safeUrl(ev.link_url);
   const paragraphs = ev.description
     .split(/\n+/)
     .map((p) => `<p style="margin:0 0 12px;line-height:1.6;color:#333;">${esc(p)}</p>`)
@@ -100,13 +118,13 @@ export function renderEventEmail(ev: EventRecord): { subject: string; html: stri
       <span style="font-size:30px;font-weight:bold;color:#1a1a1a;letter-spacing:-0.5px;">Nomikos</span><span style="font-size:30px;font-weight:bold;color:#b8962e;">.</span>
     </div>
     <div style="background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e8e2d4;">
-      ${ev.image_url ? `<img src="${ev.image_url}" alt="" width="560" style="display:block;width:100%;height:auto;" />` : ''}
+      ${imageUrl ? `<img src="${imageUrl}" alt="" width="560" style="display:block;width:100%;height:auto;" />` : ''}
       <div style="padding:28px 30px;">
         <h1 style="margin:0 0 6px;font-size:24px;color:#1a1a1a;">${esc(ev.title)}</h1>
         ${dateStr ? `<p style="margin:0 0 18px;font-size:14px;color:#b8962e;font-weight:bold;">${dateStr}</p>` : ''}
         ${paragraphs}
-        ${ev.link_url ? `<div style="text-align:center;margin:26px 0 8px;">
-          <a href="${ev.link_url}" style="display:inline-block;background:#1a1a1a;color:#ffffff;text-decoration:none;padding:12px 28px;border-radius:8px;font-size:15px;">View details</a>
+        ${linkUrl ? `<div style="text-align:center;margin:26px 0 8px;">
+          <a href="${linkUrl}" style="display:inline-block;background:#1a1a1a;color:#ffffff;text-decoration:none;padding:12px 28px;border-radius:8px;font-size:15px;">View details</a>
         </div>` : ''}
       </div>
     </div>

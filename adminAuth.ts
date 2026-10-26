@@ -61,8 +61,25 @@ export async function resolveEmail(req: Request): Promise<string | null> {
   }
 }
 
+/**
+ * CSRF guard for cookie-authenticated, state-changing requests. Our own
+ * frontend always sends X-Requested-With; a cross-site form can't set custom
+ * headers, and a cross-site fetch that sets one needs a CORS preflight that a
+ * credentialed request can't pass. Holds no matter what SameSite attribute
+ * the auth service gives the session cookie.
+ */
+export function isCsrfSafe(req: Request): boolean {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return true;
+  return req.headers['x-requested-with'] === 'XMLHttpRequest';
+}
+export const CSRF_ERROR = 'Request blocked for security reasons — refresh the page and try again.';
+
 export function makeRequireAdmin(store: Store) {
   return async function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
+    if (!isCsrfSafe(req)) {
+      res.status(403).json({ ok: false, error: CSRF_ERROR });
+      return;
+    }
     const email = await resolveEmail(req);
     if (!email) {
       res.status(401).json({ ok: false, error: 'Not signed in' });

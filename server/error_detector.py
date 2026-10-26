@@ -51,6 +51,7 @@ from extraction import extract_pages  # noqa: E402
 from merge import merge_pdfs, merge_to_doc  # noqa: E402
 from page_spec import PageSpecError, format_page_set, parse_page_spec  # noqa: E402
 from pagination import check_rule_pagination, paginate_doc, write_pagination  # noqa: E402
+from pdf_limits import enforce_page_limit  # noqa: E402
 from rules import check_rule_doc_upload  # noqa: E402
 
 
@@ -315,6 +316,8 @@ def main(argv=None):
 
     if not args.file:
         parser.error("at least one --file is required")
+
+    enforce_page_limit(list(args.file) + list(args.annex or []))
 
     if args.write_stdout and args.mode != "write":
         parser.error("--write-stdout requires --mode write")

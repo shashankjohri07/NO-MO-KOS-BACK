@@ -7,9 +7,12 @@ import { dirname, join } from 'path';
 import fs from 'fs';
 
 import { makeStore } from './store';
-import { makeRequireAdmin, makeWhoami, resolveEmail, ENV_ADMIN_EMAILS, type AuthedRequest } from './adminAuth';
 import {
-  loadBillingConfig, getEntitlement, createOrder, verifySignature,
+  makeRequireAdmin, makeWhoami, resolveEmail, isCsrfSafe, CSRF_ERROR, ENV_ADMIN_EMAILS,
+  type AuthedRequest,
+} from './adminAuth';
+import {
+  loadBillingConfig, getEntitlement, createOrder, verifySignature, fetchOrder,
   ALL_TOOLS, type BillingPlan,
 } from './billing';
 import { sendEventEmail, emailMode, renderEventEmail, applyEmailConfig, currentSender, type EmailConfig } from './email';
@@ -35,13 +38,47 @@ startPdfWorker(join(__dirname, 'server'));
 // fronting the static / proxy layer — going higher here is pointless because
 // nginx would reject first. Disk storage is used (see `dest`) so a 500MB
 // upload does not consume 500MB of process memory.
+const PDF_FIELDS = new Set(['document', 'annex']);
 const upload = multer({
   dest: UPLOAD_DIR,
   limits: { fileSize: 500 * 1024 * 1024 },
+  // Cheap first gate on the declared type. It's client-supplied, so the real
+  // check is the magic-byte one (hasMagic) run after the file lands on disk.
+  fileFilter: (_req, file, cb) => {
+    const ok = PDF_FIELDS.has(file.fieldname)
+      ? file.mimetype === 'application/pdf' || file.mimetype === 'application/octet-stream'
+      : /^image\/(png|jpe?g)$/.test(file.mimetype);
+    cb(null, ok);
+  },
 });
 
+const PDF_MAGIC = [Buffer.from('%PDF-')];
+const IMAGE_MAGIC = [
+  Buffer.from([0x89, 0x50, 0x4e, 0x47]), // PNG
+  Buffer.from([0xff, 0xd8, 0xff]), // JPEG
+];
+
+/** True when the file on disk starts with one of the given signatures. */
+function hasMagic(path: string, signatures: Buffer[]): boolean {
+  const fd = fs.openSync(path, 'r');
+  try {
+    const head = Buffer.alloc(8);
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    return signatures.some((sig) => n >= sig.length && head.subarray(0, sig.length).equals(sig));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const allPdfs = (files: Express.Multer.File[]) => files.every((f) => hasMagic(f.path, PDF_MAGIC));
+const allImages = (files: Express.Multer.File[]) => files.every((f) => hasMagic(f.path, IMAGE_MAGIC));
+const NOT_PDF_ERROR = 'One of the uploaded files is not a valid PDF. Re-export it as a PDF and try again.';
+
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
-app.use(express.json({ limit: '200mb' }));
+// Largest legitimate JSON body is the profile avatar data URL (capped at
+// 300KB below); files go through multipart/multer, not JSON. A big limit here
+// would let anyone push huge bodies at unauthenticated routes like /feedback.
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -220,6 +257,20 @@ app.delete('/api/admin/admins', requireAdmin, async (req: AuthedRequest, res: Re
   }
 });
 
+/** Optional event URL field: blank → null, http(s) → trimmed URL, anything
+ * else → undefined (caller rejects). These land in email src/href attributes
+ * sent to every subscriber, so javascript:/data: links must never be stored. */
+function parseEventUrl(v: unknown): string | null | undefined {
+  if (typeof v !== 'string' || !v.trim()) return null;
+  try {
+    const u = new URL(v.trim());
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.href.slice(0, 2000) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+const BAD_URL_ERROR = 'Image and link URLs must start with http:// or https://';
+
 // Create an event; when sendNow is true, blast the announcement to every
 // subscriber and record the sent count on the event.
 app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Response) => {
@@ -228,13 +279,19 @@ app.post('/api/admin/events', requireAdmin, async (req: AuthedRequest, res: Resp
     res.status(400).json({ ok: false, error: 'title and description are required' });
     return;
   }
+  const imageUrl = parseEventUrl(image_url);
+  const linkUrl = parseEventUrl(link_url);
+  if (imageUrl === undefined || linkUrl === undefined) {
+    res.status(400).json({ ok: false, error: BAD_URL_ERROR });
+    return;
+  }
   try {
     const event = await store.createEvent({
       title: title.trim().slice(0, 200),
       description: String(description).trim().slice(0, 5000),
       event_date: typeof event_date === 'string' ? event_date.slice(0, 10) : '',
-      image_url: typeof image_url === 'string' && image_url.trim() ? image_url.trim() : null,
-      link_url: typeof link_url === 'string' && link_url.trim() ? link_url.trim() : null,
+      image_url: imageUrl,
+      link_url: linkUrl,
       created_by: req.userEmail || 'unknown',
     });
 
@@ -438,6 +495,10 @@ app.put('/api/admin/removebg', requireAdmin, async (req: AuthedRequest, res: Res
 
 /** requireUser: any signed-in user (not necessarily an admin). */
 async function requireUser(req: AuthedRequest, res: Response): Promise<string | null> {
+  if (!isCsrfSafe(req)) {
+    res.status(403).json({ ok: false, error: CSRF_ERROR });
+    return null;
+  }
   const email = await resolveEmail(req);
   if (!email) res.status(401).json({ ok: false, error: 'Please sign in first.' });
   else req.userEmail = email;
@@ -470,7 +531,9 @@ app.put('/api/profile', async (req: AuthedRequest, res: Response) => {
   }
   let pic: string | null = null;
   if (typeof avatar === 'string' && avatar) {
-    if (!avatar.startsWith('data:image/') || avatar.length > 300_000) {
+    // Raster formats only — SVG can carry script if it's ever rendered
+    // outside an <img>. The client always sends a resized JPEG anyway.
+    if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(avatar) || avatar.length > 300_000) {
       res.status(400).json({ ok: false, error: 'Profile picture must be a small image.' });
       return;
     }
@@ -533,23 +596,38 @@ app.post('/api/billing/order', async (req: AuthedRequest, res: Response) => {
 });
 
 // Checkout success: verify the signature, then activate the subscription.
+//
+// SECURITY: the plan and email that get activated come ONLY from the
+// Razorpay order itself (fetched server-to-server, see `notes` set at
+// /api/billing/order time) — never from the client-supplied `planId` in
+// this request. Trusting the client's planId here would let anyone pay for
+// the cheapest plan, then replay that same valid orderId/paymentId/
+// signature with a different planId to get upgraded for free; trusting a
+// client-supplied email would let a leaked payment triple be redeemed on
+// any account.
 app.post('/api/billing/verify', async (req: AuthedRequest, res: Response) => {
   const email = await requireUser(req, res);
   if (!email) return;
-  const { planId, orderId, paymentId, signature } = req.body ?? {};
-  if (!planId || !orderId || !paymentId || !signature) {
+  const { orderId, paymentId, signature } = req.body ?? {};
+  if (!orderId || !paymentId || !signature) {
     res.status(400).json({ ok: false, error: 'Missing payment details.' });
     return;
   }
   try {
     const cfg = await loadBillingConfig(store);
-    const plan = cfg.plans.find((p) => p.id === String(planId));
-    if (!plan) { res.status(400).json({ ok: false, error: 'Unknown plan.' }); return; }
     if (!verifySignature(cfg, String(orderId), String(paymentId), String(signature))) {
       console.error(`[billing/verify] BAD SIGNATURE for ${email} order=${orderId}`);
       res.status(400).json({ ok: false, error: 'Payment verification failed. If money was deducted it will be auto-refunded by Razorpay.' });
       return;
     }
+    const order = await fetchOrder(cfg, String(orderId));
+    if (order.notes?.email !== email) {
+      console.error(`[billing/verify] order ${orderId} belongs to a different account (caller=${email})`);
+      res.status(403).json({ ok: false, error: 'This payment belongs to a different account.' });
+      return;
+    }
+    const plan = cfg.plans.find((p) => p.id === order.notes?.plan_id);
+    if (!plan) { res.status(400).json({ ok: false, error: 'Unknown plan.' }); return; }
     const now = new Date();
     const sub = await store.createSubscription({
       email,
@@ -680,15 +758,47 @@ app.get('/api/admin/billing/subscriptions', requireAdmin, async (_req: AuthedReq
   }
 });
 
+/**
+ * Fixed-window rate limiter for the unauthenticated write routes. In-memory
+ * is accurate here because there's a single dyno. The per-client key comes
+ * from X-Forwarded-For, which a client can spoof — so there's also a global
+ * ceiling per route that spoofing can't get around.
+ */
+function rateLimit(name: string, perClient: number, globalMax: number, windowMs = 60_000) {
+  let windowStart = Date.now();
+  let globalCount = 0;
+  let perKey = new Map<string, number>();
+  return (req: Request, res: Response, next: () => void) => {
+    const now = Date.now();
+    if (now - windowStart >= windowMs) {
+      windowStart = now;
+      globalCount = 0;
+      perKey = new Map();
+    }
+    const fwd = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
+    const key = fwd || req.socket.remoteAddress || 'unknown';
+    const n = (perKey.get(key) ?? 0) + 1;
+    perKey.set(key, n);
+    globalCount++;
+    if (n > perClient || globalCount > globalMax) {
+      console.warn(`[rate-limit] ${name} blocked (client=${key}, n=${n}, global=${globalCount})`);
+      res.status(429).json({ ok: false, error: 'Too many requests — please wait a minute and try again.' });
+      return;
+    }
+    next();
+  };
+}
+
 // Fire-and-forget tool usage tracking — no auth, ignores failures silently.
-app.post('/api/track', async (req: Request, res: Response) => {
-  const tool = String(req.body?.tool ?? '').trim().slice(0, 50);
-  if (tool) store.trackTool(tool).catch(() => {});
+// Only known tool keys count, so junk strings can't create stats buckets.
+app.post('/api/track', rateLimit('track', 60, 1000), async (req: Request, res: Response) => {
+  const tool = String(req.body?.tool ?? '').trim();
+  if (ALL_TOOLS.includes(tool)) store.trackTool(tool).catch(() => {});
   res.json({ ok: true });
 });
 
 // User feedback submission — no auth required.
-app.post('/api/feedback', async (req: Request, res: Response) => {
+app.post('/api/feedback', rateLimit('feedback', 5, 60), async (req: Request, res: Response) => {
   const message = String(req.body?.message ?? '').trim().slice(0, 2000);
   if (!message) { res.status(400).json({ ok: false, error: 'message required' }); return; }
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().slice(0, 200) : null;
@@ -728,13 +838,19 @@ app.post('/api/admin/events/test-send', requireAdmin, async (req: AuthedRequest,
     res.status(400).json({ ok: false, error: 'title and description are required' });
     return;
   }
+  const imageUrl = parseEventUrl(image_url);
+  const linkUrl = parseEventUrl(link_url);
+  if (imageUrl === undefined || linkUrl === undefined) {
+    res.status(400).json({ ok: false, error: BAD_URL_ERROR });
+    return;
+  }
   const ev = {
     id: 'test',
     title: String(title).trim().slice(0, 200),
     description: String(description).trim().slice(0, 5000),
     event_date: typeof event_date === 'string' ? event_date.slice(0, 10) : '',
-    image_url: typeof image_url === 'string' && image_url.trim() ? image_url.trim() : null,
-    link_url: typeof link_url === 'string' && link_url.trim() ? link_url.trim() : null,
+    image_url: imageUrl,
+    link_url: linkUrl,
     created_by: req.userEmail || 'test',
     created_at: new Date().toISOString(),
     sent_at: null,
@@ -753,6 +869,11 @@ app.post('/api/detect-errors', upload.array('document', 5), async (req: Request,
   const files = (req.files as Express.Multer.File[]) ?? [];
   if (files.length === 0) {
     res.status(400).json({ ok: false, error: 'No file uploaded' });
+    return;
+  }
+  if (!allPdfs(files)) {
+    for (const f of files) fs.unlink(f.path, () => {});
+    res.status(400).json({ ok: false, error: NOT_PDF_ERROR });
     return;
   }
 
@@ -836,6 +957,11 @@ app.post('/api/upload', upload.single('document'), (req: Request, res: Response)
     res.status(400).json({ success: false, error: 'No file uploaded' });
     return;
   }
+  if (!allPdfs([req.file])) {
+    fs.unlink(req.file.path, () => {});
+    res.status(400).json({ success: false, error: NOT_PDF_ERROR });
+    return;
+  }
   res.json({
     success: true,
     data: {
@@ -901,6 +1027,18 @@ app.post('/api/write-pagination', uploadDualFields, async (req: Request, res: Re
   const specialAdvocateSig = fileMap.specialSignatureAdvocate?.[0];
   if (mainFiles.length === 0) {
     res.status(400).json({ ok: false, error: 'No file uploaded' });
+    return;
+  }
+  const sigFiles = [clientSig, clientSig2, advocateSig, specialClientSig, specialClientSig2, specialAdvocateSig]
+    .filter((f): f is Express.Multer.File => !!f);
+  const pdfsOk = allPdfs([...mainFiles, ...annexFiles]);
+  const sigsOk = allImages(sigFiles);
+  if (!pdfsOk || !sigsOk) {
+    for (const f of [...mainFiles, ...annexFiles, ...sigFiles]) fs.unlink(f.path, () => {});
+    res.status(400).json({
+      ok: false,
+      error: pdfsOk ? 'Signature images must be PNG or JPG files.' : NOT_PDF_ERROR,
+    });
     return;
   }
 
@@ -1048,6 +1186,11 @@ app.post('/api/bookmarks/detect', upload.array('document', 5), (req: Request, re
   const cleanup = () => {
     for (const p of paths) fs.unlink(p, () => {});
   };
+  if (!allPdfs(files)) {
+    cleanup();
+    res.status(400).json({ ok: false, error: NOT_PDF_ERROR });
+    return;
+  }
 
   console.log(
     `[bookmarks/detect] ${files.length} file(s): ${files.map((f) => f.originalname).join(' + ')}`,
@@ -1090,6 +1233,11 @@ app.post('/api/bookmarks/apply', upload.array('document', 5), (req: Request, res
     return;
   }
   const paths = files.map((f) => f.path);
+  if (!allPdfs(files)) {
+    for (const p of paths) fs.unlink(p, () => {});
+    res.status(400).json({ ok: false, error: NOT_PDF_ERROR });
+    return;
+  }
 
   // The finalized tree arrives as a JSON string form field. Parse to
   // validate + cap size, then hand it to Python via a temp file (argv has
