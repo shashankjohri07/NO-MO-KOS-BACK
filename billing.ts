@@ -167,6 +167,24 @@ export async function createOrder(
   return { orderId: order.id, amount: order.amount, currency: order.currency };
 }
 
+/** Fetches an order back from Razorpay so /verify can check what it was
+ * ACTUALLY created for (email + plan, stashed in `notes` at creation time)
+ * instead of trusting whatever planId the client sends in the verify call. */
+export async function fetchOrder(
+  cfg: BillingConfig,
+  orderId: string,
+): Promise<{ notes: { email?: string; plan_id?: string } }> {
+  const r = await fetch(`${RZP_API}/orders/${encodeURIComponent(orderId)}`, {
+    headers: { Authorization: rzpAuth(cfg) },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!r.ok) {
+    const body = await r.text();
+    throw new Error(`razorpay order lookup failed: ${r.status} ${body.slice(0, 300)}`);
+  }
+  return r.json() as Promise<{ notes: { email?: string; plan_id?: string } }>;
+}
+
 /** Razorpay checkout success handler: verify the payment signature
  * (HMAC-SHA256 of "orderId|paymentId" keyed with the secret). */
 export function verifySignature(
